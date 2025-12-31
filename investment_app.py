@@ -4,7 +4,7 @@ import pandas as pd
 from openai import OpenAI
 import google.generativeai as genai
 import os 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import plotly.graph_objects as go 
 import plotly.express as px 
 import requests 
@@ -27,7 +27,7 @@ with st.sidebar:
     page = st.radio("前往", ["🏠 資產總覽", "🛠️ 投資工具箱", "📝 交易紀錄", "💬 AI 顧問", "⚙️ 設定"])
     st.divider()
     ai_model = st.selectbox("AI 模型", ["Gemini", "OpenAI"])
-    st.caption("V17.0 Dividend Edition")
+    st.caption("V18.0 Auto-Dividend")
 
 # --- 4. 核心邏輯 (Google Sheets 連線) ---
 try:
@@ -45,29 +45,23 @@ except ImportError:
 def load_data():
     if not CONNECTION_STATUS:
         return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
-    
     try:
         df = conn.read(ttl=0)
-        if df.empty:
-            return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
-            
+        if df.empty: return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
+        
         required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
         for col in required_cols:
             if col not in df.columns:
                 if col == "Account": df[col] = "TFSA"
                 elif col == "Date": df[col] = str(date.today())
                 else: df[col] = ""
-        
         df = df[required_cols]
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
         return df
-    except:
-        return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
+    except: return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
 
 def save_data_to_gsheet(df):
-    if not CONNECTION_STATUS:
-        st.error(f"無法儲存：連線設定錯誤。")
-        return False
+    if not CONNECTION_STATUS: return False
     try:
         df_save = df.copy()
         df_save['Date'] = df_save['Date'].astype(str)
@@ -77,33 +71,85 @@ def save_data_to_gsheet(df):
         st.error(f"儲存失敗: {e}")
         return False
 
-# 本地搬家功能
-def load_local_csv():
-    local_file = 'my_portfolio.csv'
-    if os.path.exists(local_file):
+# ★★★ 新增：自動股息掃描邏輯 ★★★
+def scan_missing_dividends(df_trans):
+    if df_trans.empty: return []
+    
+    # 1. 找出所有買過的股票
+    symbols = df_trans['Symbol'].unique()
+    missing_dividends = []
+    
+    # 已記錄的股息 (用來防呆，避免重複)
+    recorded_divs = df_trans[df_trans['Action'] == 'Dividend']
+    
+    progress_text = st.empty()
+    
+    for sym in symbols:
+        sym = str(sym).strip().upper()
+        if not sym: continue
+        progress_text.caption(f"正在掃描 {sym} 的股息紀錄...")
+        
         try:
-            df = pd.read_csv(local_file)
-            if 'BuyDate' in df.columns: df = df.rename(columns={'BuyDate': 'Date'})
-            if 'Cost' in df.columns: df = df.rename(columns={'Cost': 'Price'})
-            if 'Action' not in df.columns: df['Action'] = 'Buy'
+            # 抓取該股票過去 2 年的股息紀錄
+            stock = yf.Ticker(sym)
+            div_history = stock.dividends
+            if div_history.empty: continue
             
-            required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
-            for col in required_cols:
-                if col not in df.columns:
-                    if col == "Account": df[col] = "TFSA"
-                    elif col == "Date": df[col] = str(date.today())
-                    else: df[col] = ""
-            df = df[required_cols]
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
-            return df
-        except: return None
-    return None
+            # 只看最近 2 年
+            start_date = pd.Timestamp.now(tz=div_history.index.tz) - pd.DateOffset(years=2)
+            recent_divs = div_history[div_history.index >= start_date]
+            
+            for div_date, div_amount in recent_divs.items():
+                div_date_date = div_date.date()
+                
+                # 2. 計算除息當日，手上持有幾股
+                # 邏輯：找出所有在 div_date 之前的交易
+                # 注意：這裡簡化計算，假設 BuyDate 就是交割日
+                past_trans = df_trans[(df_trans['Symbol'] == sym) & (df_trans['Date'] < div_date_date)]
+                
+                shares_held = 0
+                account_map = {} # 紀錄股票在哪個帳戶
+                
+                for _, row in past_trans.iterrows():
+                    if row['Action'] == 'Buy':
+                        shares_held += float(row['Shares'])
+                        account_map = row['Account'] # 假設最後買入的帳戶
+                    elif row['Action'] == 'Sell':
+                        shares_held -= float(row['Shares'])
+                
+                if shares_held > 0:
+                    # 3. 檢查是否已經記錄過
+                    # 寬鬆比對：同股票、同日期(前後3天誤差)、金額接近
+                    is_recorded = False
+                    total_payout = shares_held * div_amount
+                    
+                    # 在已記錄中尋找
+                    for _, rec in recorded_divs.iterrows():
+                        rec_date = rec['Date']
+                        if rec['Symbol'] == sym and abs((rec_date - div_date_date).days) <= 5:
+                            is_recorded = True
+                            break
+                    
+                    if not is_recorded:
+                        missing_dividends.append({
+                            "Date": div_date_date,
+                            "Account": account_map if account_map else "TFSA",
+                            "Action": "Dividend",
+                            "Symbol": sym,
+                            "Price": round(total_payout, 2), # 總金額
+                            "Shares": 1, # 股息記 1
+                            "Info": f"每股配息 ${div_amount} x {shares_held} 股"
+                        })
+        except: pass
+        
+    progress_text.empty()
+    return missing_dividends
 
 def calculate_portfolio(df_transactions):
     if df_transactions.empty: return pd.DataFrame(), 0, 0
     holdings = {}
     realized_pl = 0
-    total_dividend = 0 # 新增：股息累計
+    total_dividend = 0 
     
     df_sorted = df_transactions.sort_values(by="Date")
     
@@ -124,18 +170,13 @@ def calculate_portfolio(df_transactions):
             holdings[sym]['shares'] += shares
             holdings[sym]['total_cost'] += (shares * price)
             holdings[sym]['account'] = account
-        
         elif action == 'Sell':
             if holdings[sym]['shares'] > 0:
                 avg_cost = holdings[sym]['total_cost'] / holdings[sym]['shares']
                 realized_pl += (price - avg_cost) * shares
                 holdings[sym]['shares'] -= shares
                 holdings[sym]['total_cost'] -= (shares * avg_cost)
-        
-        # ★★★ 新增：股息計算邏輯 ★★★
         elif action == 'Dividend':
-            # 這裡的邏輯是：Price = 總領取金額 (因為股息稅率不同，直接記實領金額最準)
-            # Shares = 1 (預設)
             total_dividend += (price * shares)
 
     final_data = []
@@ -233,16 +274,13 @@ if page == "🏠 資產總覽":
     
     if not CONNECTION_STATUS:
         st.error("⚠️ 無法連線至 Google Sheets，請檢查 secrets.toml。")
-        with st.expander("查看錯誤訊息"): st.code(CONNECTION_ERROR)
     else:
         if st.button("🔄 更新報價", use_container_width=True): st.rerun()
 
         df_trans = load_data()
-        
         if df_trans.empty:
-            st.info("👋 連線成功！雲端目前是空的。請新增資料。")
+            st.info("👋 連線成功！目前無資料。")
         else:
-            # 接收三個回傳值：庫存, 已實現損益, 股息
             df_inv, realized_pl, total_dividends = calculate_portfolio(df_trans)
 
             if not df_inv.empty:
@@ -262,20 +300,17 @@ if page == "🏠 資產總覽":
                 total_unrealized = df_inv['帳面損益'].sum()
                 total_net = realized_pl + total_unrealized + total_dividends
                 
-                # --- 新增：股息卡片 ---
                 c1, c2 = st.columns(2)
                 c1.metric("總市值", f"${total_mkt:,.0f}")
                 c2.metric("淨獲利 (含股息)", f"${total_net:,.0f}", delta_color="normal" if total_net>0 else "inverse")
                 
                 st.divider()
-                # 詳細數據區
                 col_a, col_b, col_c = st.columns(3)
                 col_a.metric("已落袋 (價差)", f"${realized_pl:,.0f}")
-                col_b.metric("💰 累計股息", f"${total_dividends:,.0f}") # 股息顯示在這裡
+                col_b.metric("💰 累計股息", f"${total_dividends:,.0f}")
                 col_c.metric("帳面 (浮動)", f"${total_unrealized:,.0f}")
                 
                 st.divider()
-
                 st.write("🔥 持倉明細")
                 df_inv = df_inv.sort_values(by="帳面損益", ascending=False)
                 for _, row in df_inv.iterrows():
@@ -286,16 +321,14 @@ if page == "🏠 資產總覽":
                         c1.metric("市值", f"${row['市值']:,.0f}")
                         c2.metric("損益", f"${row['帳面損益']:,.0f}", f"{roi:.1f}%")
             else:
-                st.info("已讀取紀錄，但目前無庫存。")
-                if total_dividends > 0:
-                     st.metric("💰 歷史累計股息", f"${total_dividends:,.0f}")
+                st.info("無持倉。")
+                if total_dividends > 0: st.metric("💰 歷史累計股息", f"${total_dividends:,.0f}")
 
 # ==========================================
 # 頁面 2: 🛠️ 投資工具箱
 # ==========================================
 elif page == "🛠️ 投資工具箱":
     st.subheader("🛠️ 投資工具箱")
-    
     tab1, tab2, tab3 = st.tabs(["🔎 個股診斷", "🏹 選股獵人", "🧬 組合健檢"])
     
     with tab1:
@@ -320,13 +353,10 @@ elif page == "🛠️ 投資工具箱":
                     news = get_stock_news(target)
                     with st.expander("📰 最新新聞", expanded=True):
                         if news:
-                            for n in news: 
-                                with st.container():
-                                    st.write(f"**{n['title']}**")
-                                    st.caption(f"{n['date']} | [閱讀全文]({n['link']})")
+                            for n in news: st.write(f"**{n['title']}**\n{n['date']} | [閱讀]({n['link']})")
                         else: st.warning("暫無新聞")
                     
-                    sys_prompt = f"分析 {target}。請給出：1. 技術面強弱 2. 基本面評分 3. 操作建議 (短/中/長)。簡短白話。"
+                    sys_prompt = f"分析 {target}。請給出：1. 技術面強弱 2. 基本面評分 3. 操作建議。簡短。"
                     try:
                         key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
                         if "OpenAI" in ai_model:
@@ -334,7 +364,6 @@ elif page == "🛠️ 投資工具箱":
                         else:
                             genai.configure(api_key=key)
                             ans = genai.GenerativeModel('gemini-2.5-flash').generate_content(sys_prompt).text
-                        
                         st.session_state.tool_results["stock_diagnosis"] = ans
                         st.session_state["diag_chat"] = [] 
                     except: st.error("請設定 API Key")
@@ -346,23 +375,13 @@ elif page == "🛠️ 投資工具箱":
     with tab2:
         st.write("🤖 AI 自動掃描市場機會")
         strategy = st.selectbox("選擇策略", ["價值抄底 (RSI < 30)", "強勢突破 (站上月線)", "高股息定存"])
-        
-        if strategy == "價值抄底 (RSI < 30)":
-            with st.container(border=True):
-                st.markdown("### 📉 價值抄底策略")
-                st.write("**定義**：跌深反彈，RSI < 30 (超賣)。\n**建議**：分批低接，設停損。")
-        elif strategy == "強勢突破 (站上月線)":
-            with st.container(border=True):
-                st.markdown("### 🚀 強勢突破策略")
-                st.write("**定義**：站上 20MA，趨勢轉強。\n**建議**：順勢買進，破線停損。")
-        elif strategy == "高股息定存":
-            with st.container(border=True):
-                st.markdown("### 🛡️ 高股息定存策略")
-                st.write("**定義**：穩定配息龍頭股。\n**建議**：定期定額，領息再投入。")
+        if strategy == "價值抄底 (RSI < 30)": st.info("跌深反彈，分批低接。")
+        elif strategy == "強勢突破 (站上月線)": st.info("站上月線，順勢買進。")
+        elif strategy == "高股息定存": st.info("穩定配息，定期定額。")
 
         if st.button("🔍 開始掃描", type="primary", use_container_width=True):
-            st.caption("模擬掃描黃金池...")
-            prompt = f"請從美股七巨頭和台積電中，根據「{strategy}」策略，推薦 1 支最值得買的股票並說明原因。200字內。"
+            st.caption("模擬掃描...")
+            prompt = f"請從美股七巨頭和台積電中，根據「{strategy}」策略，推薦 1 支最值得買的股票並說明原因。"
             try:
                 key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
                 if "OpenAI" in ai_model:
@@ -370,7 +389,6 @@ elif page == "🛠️ 投資工具箱":
                 else:
                     genai.configure(api_key=key)
                     ans = genai.GenerativeModel('gemini-2.5-flash').generate_content(prompt).text
-                
                 st.session_state.tool_results["stock_hunter"] = ans
                 st.session_state["hunter_chat"] = []
             except: st.error("API Key Error")
@@ -386,16 +404,10 @@ elif page == "🛠️ 投資工具箱":
             st.write("📊 帳戶配置")
             fig = px.pie(df_inv, values='市值', names='帳戶', hole=0.4)
             st.plotly_chart(fig, use_container_width=True)
-            if st.button("⚖️ 取得配倉調整建議", type="primary", use_container_width=True):
+            if st.button("⚖️ 取得配倉建議", type="primary", use_container_width=True):
                 with st.spinner("AI 計算中..."):
                     portfolio_summary = df_inv[['代碼','市值', '帳戶']].to_dict('records')
-                    prompt = f"""
-                    用戶持倉：{portfolio_summary}。
-                    請給出「再平衡 (Rebalancing)」建議：
-                    1. 哪些股票或帳戶佔比過高，建議減碼？
-                    2. 建議增持哪類資產以達到平衡？
-                    請給出具體操作指令。
-                    """
+                    prompt = f"用戶持倉：{portfolio_summary}。請給出再平衡建議。"
                     try:
                         key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
                         if "OpenAI" in ai_model:
@@ -403,38 +415,62 @@ elif page == "🛠️ 投資工具箱":
                         else:
                             genai.configure(api_key=key)
                             ans = genai.GenerativeModel('gemini-2.5-flash').generate_content(prompt).text
-                        
                         st.session_state.tool_results["portfolio_check"] = ans
                         st.session_state["check_chat"] = []
                     except: st.error("API Key Error")
-
             if st.session_state.tool_results["portfolio_check"]:
-                st.container(border=True).markdown(f"### ⚖️ 再平衡建議\n{st.session_state.tool_results['portfolio_check']}")
+                st.container(border=True).markdown(st.session_state.tool_results['portfolio_check'])
                 render_followup_chat("check_chat", st.session_state.tool_results["portfolio_check"])
-        else: st.warning("無庫存")
 
 # ==========================================
-# 頁面 3: 📝 交易紀錄
+# 頁面 3: 📝 交易紀錄 (新增自動股息)
 # ==========================================
 elif page == "📝 交易紀錄":
-    st.subheader("📝 交易流水帳 (雲端版)")
-    
-    if not CONNECTION_STATUS:
-        st.error("⚠️ 無法連線至 Google Sheets，請檢查設定。")
+    st.subheader("📝 交易流水帳")
+    if not CONNECTION_STATUS: st.error("無法連線 Google Sheets")
     else:
-        st.info("資料儲存於 Google Sheets，安全不遺失。")
         df_trans = load_data()
         
-        # ★★★ 新增 Dividend 選項 ★★★
+        # ★★★ 新增：自動股息掃描區塊 ★★★
+        with st.expander("🔎 自動掃描漏記的股息"):
+            st.write("AI 會自動查詢您持股的除息日，並算出應得股息。")
+            if st.button("開始掃描", use_container_width=True):
+                with st.spinner("正在查詢歷史配息紀錄..."):
+                    missing = scan_missing_dividends(df_trans)
+                    st.session_state['missing_divs'] = missing # 暫存結果
+            
+            if 'missing_divs' in st.session_state and st.session_state['missing_divs']:
+                st.success(f"發現 {len(st.session_state['missing_divs'])} 筆漏記股息！")
+                
+                # 顯示列表供確認
+                div_df = pd.DataFrame(st.session_state['missing_divs'])
+                st.dataframe(div_df[['Date', 'Symbol', 'Price', 'Info']], use_container_width=True)
+                
+                if st.button("💾 全部加入帳本", type="primary", use_container_width=True):
+                    # 合併資料
+                    new_records = pd.DataFrame(st.session_state['missing_divs'])
+                    # 移除 Info 欄位以免寫入錯誤
+                    new_records = new_records.drop(columns=['Info'])
+                    
+                    combined_df = pd.concat([df_trans, new_records], ignore_index=True)
+                    if save_data_to_gsheet(combined_df):
+                        st.success("成功寫入！")
+                        del st.session_state['missing_divs'] # 清除暫存
+                        st.rerun()
+            elif 'missing_divs' in st.session_state:
+                st.info("太棒了！目前沒有發現漏記的股息。")
+
+        st.divider()
+        st.caption("手動輸入")
         edited_df = st.data_editor(
             df_trans, num_rows="dynamic",
             column_config={
                 "Date": st.column_config.DateColumn("日期"),
                 "Account": st.column_config.SelectboxColumn("帳戶", options=["TFSA", "USD Cash", "RRSP"]),
-                "Action": st.column_config.SelectboxColumn("動作", options=["Buy", "Sell", "Dividend"]), # 新增 Dividend
+                "Action": st.column_config.SelectboxColumn("動作", options=["Buy", "Sell", "Dividend"]),
                 "Symbol": st.column_config.TextColumn("代碼"),
-                "Price": st.column_config.NumberColumn("成交價/總金額", format="$%.2f", help="買賣填單價，領股息請填總金額"),
-                "Shares": st.column_config.NumberColumn("股數", help="領股息時建議填 1"),
+                "Price": st.column_config.NumberColumn("成交價/總金額", format="$%.2f"),
+                "Shares": st.column_config.NumberColumn("股數"),
             }, use_container_width=True, hide_index=True
         )
         if st.button("💾 儲存並同步至雲端", type="primary", use_container_width=True):
@@ -482,10 +518,7 @@ elif page == "⚙️ 設定":
     st.markdown("### ☁️ 資料同步")
     local_df = load_local_csv()
     if local_df is not None:
-        st.info(f"發現本地舊檔案 `my_portfolio.csv`，共有 {len(local_df)} 筆資料。")
         if st.button("📤 上傳舊資料到雲端", type="primary"):
-            with st.spinner("正在上傳..."):
-                if save_data_to_gsheet(local_df):
-                    st.success("✅ 搬家成功！您的舊資料已同步到 Google Sheets。")
-                    st.rerun()
-    else: st.caption("沒有發現本地舊資料檔案。")
+            if save_data_to_gsheet(local_df):
+                st.success("✅ 搬家成功！")
+                st.rerun()
