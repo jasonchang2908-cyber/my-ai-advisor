@@ -27,7 +27,7 @@ with st.sidebar:
     page = st.radio("前往", ["🏠 資產總覽", "🛠️ 投資工具箱", "📝 交易紀錄", "💬 AI 顧問", "⚙️ 設定"])
     st.divider()
     ai_model = st.selectbox("AI 模型", ["Gemini", "OpenAI"])
-    st.caption("V16.2 Migration Edition")
+    st.caption("V17.0 Dividend Edition")
 
 # --- 4. 核心邏輯 (Google Sheets 連線) ---
 try:
@@ -77,13 +77,12 @@ def save_data_to_gsheet(df):
         st.error(f"儲存失敗: {e}")
         return False
 
-# ★★★ 新增：從本地 CSV 讀取舊資料 ★★★
+# 本地搬家功能
 def load_local_csv():
     local_file = 'my_portfolio.csv'
     if os.path.exists(local_file):
         try:
             df = pd.read_csv(local_file)
-            # 簡單清洗格式以符合雲端版
             if 'BuyDate' in df.columns: df = df.rename(columns={'BuyDate': 'Date'})
             if 'Cost' in df.columns: df = df.rename(columns={'Cost': 'Price'})
             if 'Action' not in df.columns: df['Action'] = 'Buy'
@@ -94,7 +93,6 @@ def load_local_csv():
                     if col == "Account": df[col] = "TFSA"
                     elif col == "Date": df[col] = str(date.today())
                     else: df[col] = ""
-            
             df = df[required_cols]
             df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
             return df
@@ -102,9 +100,11 @@ def load_local_csv():
     return None
 
 def calculate_portfolio(df_transactions):
-    if df_transactions.empty: return pd.DataFrame(), 0
+    if df_transactions.empty: return pd.DataFrame(), 0, 0
     holdings = {}
     realized_pl = 0
+    total_dividend = 0 # 新增：股息累計
+    
     df_sorted = df_transactions.sort_values(by="Date")
     
     for _, row in df_sorted.iterrows():
@@ -124,12 +124,19 @@ def calculate_portfolio(df_transactions):
             holdings[sym]['shares'] += shares
             holdings[sym]['total_cost'] += (shares * price)
             holdings[sym]['account'] = account
+        
         elif action == 'Sell':
             if holdings[sym]['shares'] > 0:
                 avg_cost = holdings[sym]['total_cost'] / holdings[sym]['shares']
                 realized_pl += (price - avg_cost) * shares
                 holdings[sym]['shares'] -= shares
                 holdings[sym]['total_cost'] -= (shares * avg_cost)
+        
+        # ★★★ 新增：股息計算邏輯 ★★★
+        elif action == 'Dividend':
+            # 這裡的邏輯是：Price = 總領取金額 (因為股息稅率不同，直接記實領金額最準)
+            # Shares = 1 (預設)
+            total_dividend += (price * shares)
 
     final_data = []
     for sym, data in holdings.items():
@@ -138,7 +145,7 @@ def calculate_portfolio(df_transactions):
                 "帳戶": data['account'], "代碼": sym, "持股": data['shares'],
                 "總成本": data['total_cost'], "均價": data['total_cost']/data['shares']
             })
-    return pd.DataFrame(final_data), realized_pl
+    return pd.DataFrame(final_data), realized_pl, total_dividend
 
 # --- 工具函數 ---
 def get_realtime_price(symbol):
@@ -232,12 +239,11 @@ if page == "🏠 資產總覽":
 
         df_trans = load_data()
         
-        # 如果雲端沒資料，提醒用戶去「設定」搬家
         if df_trans.empty:
-            st.info("👋 連線成功！雲端目前是空的。")
-            st.warning("👉 請前往「⚙️ 設定」頁面，點擊「上傳舊資料」按鈕，將電腦裡的紀錄同步上去。")
+            st.info("👋 連線成功！雲端目前是空的。請新增資料。")
         else:
-            df_inv, realized_pl = calculate_portfolio(df_trans)
+            # 接收三個回傳值：庫存, 已實現損益, 股息
+            df_inv, realized_pl, total_dividends = calculate_portfolio(df_trans)
 
             if not df_inv.empty:
                 total_mkt = 0
@@ -254,12 +260,20 @@ if page == "🏠 資產總覽":
                 
                 total_mkt = df_inv['市值'].sum()
                 total_unrealized = df_inv['帳面損益'].sum()
-                total_net = realized_pl + total_unrealized
+                total_net = realized_pl + total_unrealized + total_dividends
                 
+                # --- 新增：股息卡片 ---
                 c1, c2 = st.columns(2)
                 c1.metric("總市值", f"${total_mkt:,.0f}")
-                c2.metric("淨獲利", f"${total_net:,.0f}", delta_color="normal" if total_net>0 else "inverse")
-                st.caption(f"已實現: ${realized_pl:,.0f} | 帳面: ${total_unrealized:,.0f}")
+                c2.metric("淨獲利 (含股息)", f"${total_net:,.0f}", delta_color="normal" if total_net>0 else "inverse")
+                
+                st.divider()
+                # 詳細數據區
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("已落袋 (價差)", f"${realized_pl:,.0f}")
+                col_b.metric("💰 累計股息", f"${total_dividends:,.0f}") # 股息顯示在這裡
+                col_c.metric("帳面 (浮動)", f"${total_unrealized:,.0f}")
+                
                 st.divider()
 
                 st.write("🔥 持倉明細")
@@ -273,6 +287,8 @@ if page == "🏠 資產總覽":
                         c2.metric("損益", f"${row['帳面損益']:,.0f}", f"{roi:.1f}%")
             else:
                 st.info("已讀取紀錄，但目前無庫存。")
+                if total_dividends > 0:
+                     st.metric("💰 歷史累計股息", f"${total_dividends:,.0f}")
 
 # ==========================================
 # 頁面 2: 🛠️ 投資工具箱
@@ -308,8 +324,7 @@ elif page == "🛠️ 投資工具箱":
                                 with st.container():
                                     st.write(f"**{n['title']}**")
                                     st.caption(f"{n['date']} | [閱讀全文]({n['link']})")
-                        else: 
-                            st.warning("暫無新聞")
+                        else: st.warning("暫無新聞")
                     
                     sys_prompt = f"分析 {target}。請給出：1. 技術面強弱 2. 基本面評分 3. 操作建議 (短/中/長)。簡短白話。"
                     try:
@@ -365,14 +380,12 @@ elif page == "🛠️ 投資工具箱":
             render_followup_chat("hunter_chat", st.session_state.tool_results["stock_hunter"])
 
     with tab3:
-        df_inv, _ = calculate_portfolio(load_data())
+        df_inv, _, _ = calculate_portfolio(load_data())
         if not df_inv.empty:
             for i, r in df_inv.iterrows(): df_inv.at[i, '市值'] = get_realtime_price(r['代碼']) * r['持股']
-            
             st.write("📊 帳戶配置")
             fig = px.pie(df_inv, values='市值', names='帳戶', hole=0.4)
             st.plotly_chart(fig, use_container_width=True)
-            
             if st.button("⚖️ 取得配倉調整建議", type="primary", use_container_width=True):
                 with st.spinner("AI 計算中..."):
                     portfolio_summary = df_inv[['代碼','市值', '帳戶']].to_dict('records')
@@ -393,7 +406,6 @@ elif page == "🛠️ 投資工具箱":
                         
                         st.session_state.tool_results["portfolio_check"] = ans
                         st.session_state["check_chat"] = []
-
                     except: st.error("API Key Error")
 
             if st.session_state.tool_results["portfolio_check"]:
@@ -413,15 +425,16 @@ elif page == "📝 交易紀錄":
         st.info("資料儲存於 Google Sheets，安全不遺失。")
         df_trans = load_data()
         
+        # ★★★ 新增 Dividend 選項 ★★★
         edited_df = st.data_editor(
             df_trans, num_rows="dynamic",
             column_config={
                 "Date": st.column_config.DateColumn("日期"),
                 "Account": st.column_config.SelectboxColumn("帳戶", options=["TFSA", "USD Cash", "RRSP"]),
-                "Action": st.column_config.SelectboxColumn("動作", options=["Buy", "Sell"]),
+                "Action": st.column_config.SelectboxColumn("動作", options=["Buy", "Sell", "Dividend"]), # 新增 Dividend
                 "Symbol": st.column_config.TextColumn("代碼"),
-                "Price": st.column_config.NumberColumn("成交價", format="$%.2f"),
-                "Shares": st.column_config.NumberColumn("股數"),
+                "Price": st.column_config.NumberColumn("成交價/總金額", format="$%.2f", help="買賣填單價，領股息請填總金額"),
+                "Shares": st.column_config.NumberColumn("股數", help="領股息時建議填 1"),
             }, use_container_width=True, hide_index=True
         )
         if st.button("💾 儲存並同步至雲端", type="primary", use_container_width=True):
@@ -454,11 +467,10 @@ elif page == "💬 AI 顧問":
                 st.session_state.messages.append({"role": "assistant", "content": ans})
 
 # ==========================================
-# 頁面 5: ⚙️ 設定 (包含搬家工具)
+# 頁面 5: ⚙️ 設定
 # ==========================================
 elif page == "⚙️ 設定":
     st.subheader("設定")
-    
     with st.expander("🔑 更新 API 金鑰"):
         new_o = st.text_input("OpenAI Key", value=st.session_state.openai_key, type="password")
         new_g = st.text_input("Gemini Key", value=st.session_state.gemini_key, type="password")
@@ -466,24 +478,14 @@ elif page == "⚙️ 設定":
             st.session_state.openai_key = new_o
             st.session_state.gemini_key = new_g
             st.success("Updated!")
-
     st.divider()
-    
-    # ★★★ 新增：搬家按鈕區 ★★★
     st.markdown("### ☁️ 資料同步")
-    st.caption("如果您剛從舊版升級，且雲端是空的，請按下方按鈕將電腦裡的舊紀錄上傳。")
-    
-    # 檢查是否有本地舊檔
     local_df = load_local_csv()
     if local_df is not None:
         st.info(f"發現本地舊檔案 `my_portfolio.csv`，共有 {len(local_df)} 筆資料。")
-        
-        col1, col2 = st.columns([1,2])
-        with col1:
-            if st.button("📤 上傳舊資料到雲端", type="primary"):
-                with st.spinner("正在上傳..."):
-                    if save_data_to_gsheet(local_df):
-                        st.success("✅ 搬家成功！您的舊資料已同步到 Google Sheets。")
-                        st.rerun()
-    else:
-        st.caption("沒有發現本地舊資料檔案 (my_portfolio.csv)。")
+        if st.button("📤 上傳舊資料到雲端", type="primary"):
+            with st.spinner("正在上傳..."):
+                if save_data_to_gsheet(local_df):
+                    st.success("✅ 搬家成功！您的舊資料已同步到 Google Sheets。")
+                    st.rerun()
+    else: st.caption("沒有發現本地舊資料檔案。")
