@@ -9,7 +9,6 @@ import plotly.graph_objects as go
 import plotly.express as px 
 import requests 
 import xml.etree.ElementTree as ET
-from streamlit_gsheets import GSheetsConnection # 新增：Google Sheets 連線套件
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="AI 投資指揮中心", layout="centered", initial_sidebar_state="collapsed")
@@ -19,7 +18,6 @@ if "messages" not in st.session_state: st.session_state.messages = []
 if "openai_key" not in st.session_state: st.session_state.openai_key = st.secrets.get("OPENAI_API_KEY", "")
 if "gemini_key" not in st.session_state: st.session_state.gemini_key = st.secrets.get("GEMINI_API_KEY", "")
 
-# 儲存分析結果
 if "tool_results" not in st.session_state:
     st.session_state.tool_results = {"stock_diagnosis": None, "stock_hunter": None, "portfolio_check": None}
 
@@ -29,25 +27,30 @@ with st.sidebar:
     page = st.radio("前往", ["🏠 資產總覽", "🛠️ 投資工具箱", "📝 交易紀錄", "💬 AI 顧問", "⚙️ 設定"])
     st.divider()
     ai_model = st.selectbox("AI 模型", ["Gemini", "OpenAI"])
-    st.caption("V16.0 Cloud Database Edition")
+    st.caption("V16.2 Migration Edition")
 
-# --- 4. 核心邏輯 (改為 Google Sheets) ---
-
-# 建立連線物件
-conn = st.connection("gsheets", type=GSheetsConnection)
+# --- 4. 核心邏輯 (Google Sheets 連線) ---
+try:
+    from streamlit_gsheets import GSheetsConnection
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        CONNECTION_STATUS = True
+    except Exception as e:
+        CONNECTION_STATUS = False
+        CONNECTION_ERROR = str(e)
+except ImportError:
+    st.error("⚠️ 嚴重錯誤：缺少套件。請在終端機執行 `pip install st-gsheets-connection`")
+    st.stop()
 
 def load_data():
+    if not CONNECTION_STATUS:
+        return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
+    
     try:
-        # read() 會自動讀取 secrets 裡設定的 spreadsheet URL
-        # ttl=0 代表不快取，每次都抓最新資料
         df = conn.read(ttl=0)
-        
-        # 如果是空的 Sheet，dataframe 可能會是空的，手動建立欄位
         if df.empty:
             return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
             
-        # 資料清洗與型別轉換
-        # 確保欄位存在
         required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
         for col in required_cols:
             if col not in df.columns:
@@ -56,18 +59,16 @@ def load_data():
                 else: df[col] = ""
         
         df = df[required_cols]
-        # 轉換日期
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
         return df
-    except Exception as e:
-        # 如果連線失敗或 Sheet 是全新的，回傳空表
-        # st.error(f"連線 Google Sheets 失敗: {e}") 
+    except:
         return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
 
 def save_data_to_gsheet(df):
+    if not CONNECTION_STATUS:
+        st.error(f"無法儲存：連線設定錯誤。")
+        return False
     try:
-        # 寫入資料
-        # 日期轉字串，避免 JSON 序列化錯誤
         df_save = df.copy()
         df_save['Date'] = df_save['Date'].astype(str)
         conn.update(data=df_save)
@@ -75,6 +76,30 @@ def save_data_to_gsheet(df):
     except Exception as e:
         st.error(f"儲存失敗: {e}")
         return False
+
+# ★★★ 新增：從本地 CSV 讀取舊資料 ★★★
+def load_local_csv():
+    local_file = 'my_portfolio.csv'
+    if os.path.exists(local_file):
+        try:
+            df = pd.read_csv(local_file)
+            # 簡單清洗格式以符合雲端版
+            if 'BuyDate' in df.columns: df = df.rename(columns={'BuyDate': 'Date'})
+            if 'Cost' in df.columns: df = df.rename(columns={'Cost': 'Price'})
+            if 'Action' not in df.columns: df['Action'] = 'Buy'
+            
+            required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
+            for col in required_cols:
+                if col not in df.columns:
+                    if col == "Account": df[col] = "TFSA"
+                    elif col == "Date": df[col] = str(date.today())
+                    else: df[col] = ""
+            
+            df = df[required_cols]
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+            return df
+        except: return None
+    return None
 
 def calculate_portfolio(df_transactions):
     if df_transactions.empty: return pd.DataFrame(), 0
@@ -89,7 +114,7 @@ def calculate_portfolio(df_transactions):
             action = row['Action']
             shares = float(row['Shares'])
             price = float(row['Price'])
-        except: continue # 跳過格式錯誤的資料
+        except: continue 
         
         account = row.get('Account', 'TFSA')
         
@@ -198,51 +223,56 @@ def render_followup_chat(context_key, context_text):
 # ==========================================
 if page == "🏠 資產總覽":
     st.subheader("💰 資產戰情室")
-    if st.button("🔄 更新報價", use_container_width=True): st.rerun()
-
-    df_trans = load_data()
     
-    # 檢查是否讀取成功
-    if df_trans.empty and 'Action' not in df_trans.columns:
-        st.info("👋 歡迎！目前 Google Sheet 是空的。請到「交易紀錄」新增第一筆資料。")
+    if not CONNECTION_STATUS:
+        st.error("⚠️ 無法連線至 Google Sheets，請檢查 secrets.toml。")
+        with st.expander("查看錯誤訊息"): st.code(CONNECTION_ERROR)
     else:
-        df_inv, realized_pl = calculate_portfolio(df_trans)
+        if st.button("🔄 更新報價", use_container_width=True): st.rerun()
 
-        if not df_inv.empty:
-            total_mkt = 0
-            df_inv['現價'] = 0.0
-            df_inv['市值'] = 0.0
-            df_inv['帳面損益'] = 0.0
-            
-            with st.spinner('同步市場數據...'):
-                for i, row in df_inv.iterrows():
-                    p = get_realtime_price(row['代碼'])
-                    df_inv.at[i, '現價'] = p
-                    df_inv.at[i, '市值'] = p * row['持股']
-                    df_inv.at[i, '帳面損益'] = (p - row['均價']) * row['持股']
-            
-            total_mkt = df_inv['市值'].sum()
-            total_unrealized = df_inv['帳面損益'].sum()
-            total_net = realized_pl + total_unrealized
-            
-            c1, c2 = st.columns(2)
-            c1.metric("總市值", f"${total_mkt:,.0f}")
-            c2.metric("淨獲利", f"${total_net:,.0f}", delta_color="normal" if total_net>0 else "inverse")
-            st.caption(f"已實現: ${realized_pl:,.0f} | 帳面: ${total_unrealized:,.0f}")
-            st.divider()
-
-            st.write("🔥 持倉明細")
-            df_inv = df_inv.sort_values(by="帳面損益", ascending=False)
-            for _, row in df_inv.iterrows():
-                color = "🟢" if row['帳面損益'] > 0 else "🔴"
-                roi = (row['帳面損益'] / row['總成本'] * 100) if row['總成本']>0 else 0
-                with st.expander(f"{color} {row['代碼']} (${row['現價']:.2f})"):
-                    c1, c2 = st.columns(2)
-                    c1.metric("市值", f"${row['市值']:,.0f}")
-                    c2.metric("損益", f"${row['帳面損益']:,.0f}", f"{roi:.1f}%")
+        df_trans = load_data()
+        
+        # 如果雲端沒資料，提醒用戶去「設定」搬家
+        if df_trans.empty:
+            st.info("👋 連線成功！雲端目前是空的。")
+            st.warning("👉 請前往「⚙️ 設定」頁面，點擊「上傳舊資料」按鈕，將電腦裡的紀錄同步上去。")
         else:
-            if not df_trans.empty:
-                st.info("已讀取交易紀錄，但目前無庫存 (可能全數賣出)。")
+            df_inv, realized_pl = calculate_portfolio(df_trans)
+
+            if not df_inv.empty:
+                total_mkt = 0
+                df_inv['現價'] = 0.0
+                df_inv['市值'] = 0.0
+                df_inv['帳面損益'] = 0.0
+                
+                with st.spinner('同步市場數據...'):
+                    for i, row in df_inv.iterrows():
+                        p = get_realtime_price(row['代碼'])
+                        df_inv.at[i, '現價'] = p
+                        df_inv.at[i, '市值'] = p * row['持股']
+                        df_inv.at[i, '帳面損益'] = (p - row['均價']) * row['持股']
+                
+                total_mkt = df_inv['市值'].sum()
+                total_unrealized = df_inv['帳面損益'].sum()
+                total_net = realized_pl + total_unrealized
+                
+                c1, c2 = st.columns(2)
+                c1.metric("總市值", f"${total_mkt:,.0f}")
+                c2.metric("淨獲利", f"${total_net:,.0f}", delta_color="normal" if total_net>0 else "inverse")
+                st.caption(f"已實現: ${realized_pl:,.0f} | 帳面: ${total_unrealized:,.0f}")
+                st.divider()
+
+                st.write("🔥 持倉明細")
+                df_inv = df_inv.sort_values(by="帳面損益", ascending=False)
+                for _, row in df_inv.iterrows():
+                    color = "🟢" if row['帳面損益'] > 0 else "🔴"
+                    roi = (row['帳面損益'] / row['總成本'] * 100) if row['總成本']>0 else 0
+                    with st.expander(f"{color} {row['代碼']} (${row['現價']:.2f})"):
+                        c1, c2 = st.columns(2)
+                        c1.metric("市值", f"${row['市值']:,.0f}")
+                        c2.metric("損益", f"${row['帳面損益']:,.0f}", f"{roi:.1f}%")
+            else:
+                st.info("已讀取紀錄，但目前無庫存。")
 
 # ==========================================
 # 頁面 2: 🛠️ 投資工具箱
@@ -252,7 +282,6 @@ elif page == "🛠️ 投資工具箱":
     
     tab1, tab2, tab3 = st.tabs(["🔎 個股診斷", "🏹 選股獵人", "🧬 組合健檢"])
     
-    # --- Tab 1: 個股診斷 ---
     with tab1:
         df_trans = load_data()
         my_stocks = df_trans['Symbol'].unique().tolist() if not df_trans.empty else []
@@ -299,7 +328,6 @@ elif page == "🛠️ 投資工具箱":
             st.info(st.session_state.tool_results["stock_diagnosis"])
             render_followup_chat("diag_chat", st.session_state.tool_results["stock_diagnosis"])
 
-    # --- Tab 2: 選股獵人 ---
     with tab2:
         st.write("🤖 AI 自動掃描市場機會")
         strategy = st.selectbox("選擇策略", ["價值抄底 (RSI < 30)", "強勢突破 (站上月線)", "高股息定存"])
@@ -336,7 +364,6 @@ elif page == "🛠️ 投資工具箱":
             st.success(st.session_state.tool_results["stock_hunter"])
             render_followup_chat("hunter_chat", st.session_state.tool_results["stock_hunter"])
 
-    # --- Tab 3: 組合健檢 ---
     with tab3:
         df_inv, _ = calculate_portfolio(load_data())
         if not df_inv.empty:
@@ -379,25 +406,28 @@ elif page == "🛠️ 投資工具箱":
 # ==========================================
 elif page == "📝 交易紀錄":
     st.subheader("📝 交易流水帳 (雲端版)")
-    st.info("資料將儲存於 Google Sheets，不會消失。")
     
-    df_trans = load_data()
-    
-    edited_df = st.data_editor(
-        df_trans, num_rows="dynamic",
-        column_config={
-            "Date": st.column_config.DateColumn("日期"),
-            "Account": st.column_config.SelectboxColumn("帳戶", options=["TFSA", "USD Cash", "RRSP"]),
-            "Action": st.column_config.SelectboxColumn("動作", options=["Buy", "Sell"]),
-            "Symbol": st.column_config.TextColumn("代碼"),
-            "Price": st.column_config.NumberColumn("成交價", format="$%.2f"),
-            "Shares": st.column_config.NumberColumn("股數"),
-        }, use_container_width=True, hide_index=True
-    )
-    if st.button("💾 儲存並同步至雲端", type="primary", use_container_width=True):
-        if save_data_to_gsheet(edited_df):
-            st.success("✅ 雲端同步成功！")
-            st.rerun()
+    if not CONNECTION_STATUS:
+        st.error("⚠️ 無法連線至 Google Sheets，請檢查設定。")
+    else:
+        st.info("資料儲存於 Google Sheets，安全不遺失。")
+        df_trans = load_data()
+        
+        edited_df = st.data_editor(
+            df_trans, num_rows="dynamic",
+            column_config={
+                "Date": st.column_config.DateColumn("日期"),
+                "Account": st.column_config.SelectboxColumn("帳戶", options=["TFSA", "USD Cash", "RRSP"]),
+                "Action": st.column_config.SelectboxColumn("動作", options=["Buy", "Sell"]),
+                "Symbol": st.column_config.TextColumn("代碼"),
+                "Price": st.column_config.NumberColumn("成交價", format="$%.2f"),
+                "Shares": st.column_config.NumberColumn("股數"),
+            }, use_container_width=True, hide_index=True
+        )
+        if st.button("💾 儲存並同步至雲端", type="primary", use_container_width=True):
+            if save_data_to_gsheet(edited_df):
+                st.success("✅ 雲端同步成功！")
+                st.rerun()
 
 # ==========================================
 # 頁面 4: 💬 AI 顧問
@@ -424,13 +454,36 @@ elif page == "💬 AI 顧問":
                 st.session_state.messages.append({"role": "assistant", "content": ans})
 
 # ==========================================
-# 頁面 5: ⚙️ 設定
+# 頁面 5: ⚙️ 設定 (包含搬家工具)
 # ==========================================
 elif page == "⚙️ 設定":
     st.subheader("設定")
-    new_o = st.text_input("OpenAI Key", value=st.session_state.openai_key, type="password")
-    new_g = st.text_input("Gemini Key", value=st.session_state.gemini_key, type="password")
-    if st.button("更新金鑰", use_container_width=True):
-        st.session_state.openai_key = new_o
-        st.session_state.gemini_key = new_g
-        st.success("Updated!")
+    
+    with st.expander("🔑 更新 API 金鑰"):
+        new_o = st.text_input("OpenAI Key", value=st.session_state.openai_key, type="password")
+        new_g = st.text_input("Gemini Key", value=st.session_state.gemini_key, type="password")
+        if st.button("更新金鑰", use_container_width=True):
+            st.session_state.openai_key = new_o
+            st.session_state.gemini_key = new_g
+            st.success("Updated!")
+
+    st.divider()
+    
+    # ★★★ 新增：搬家按鈕區 ★★★
+    st.markdown("### ☁️ 資料同步")
+    st.caption("如果您剛從舊版升級，且雲端是空的，請按下方按鈕將電腦裡的舊紀錄上傳。")
+    
+    # 檢查是否有本地舊檔
+    local_df = load_local_csv()
+    if local_df is not None:
+        st.info(f"發現本地舊檔案 `my_portfolio.csv`，共有 {len(local_df)} 筆資料。")
+        
+        col1, col2 = st.columns([1,2])
+        with col1:
+            if st.button("📤 上傳舊資料到雲端", type="primary"):
+                with st.spinner("正在上傳..."):
+                    if save_data_to_gsheet(local_df):
+                        st.success("✅ 搬家成功！您的舊資料已同步到 Google Sheets。")
+                        st.rerun()
+    else:
+        st.caption("沒有發現本地舊資料檔案 (my_portfolio.csv)。")
