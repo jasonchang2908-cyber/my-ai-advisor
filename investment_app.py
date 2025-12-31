@@ -7,8 +7,9 @@ import os
 from datetime import datetime, date
 import plotly.graph_objects as go 
 import plotly.express as px 
-import requests # 新增：用於抓取 Google News
-import xml.etree.ElementTree as ET # 新增：用於解析新聞 RSS
+import requests 
+import xml.etree.ElementTree as ET
+from streamlit_gsheets import GSheetsConnection # 新增：Google Sheets 連線套件
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="AI 投資指揮中心", layout="centered", initial_sidebar_state="collapsed")
@@ -28,29 +29,52 @@ with st.sidebar:
     page = st.radio("前往", ["🏠 資產總覽", "🛠️ 投資工具箱", "📝 交易紀錄", "💬 AI 顧問", "⚙️ 設定"])
     st.divider()
     ai_model = st.selectbox("AI 模型", ["Gemini", "OpenAI"])
+    st.caption("V16.0 Cloud Database Edition")
 
-# --- 4. 核心邏輯 ---
-csv_file = 'my_portfolio.csv'
+# --- 4. 核心邏輯 (改為 Google Sheets) ---
+
+# 建立連線物件
+conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_data():
-    if not os.path.exists(csv_file):
-        return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
     try:
-        df = pd.read_csv(csv_file)
-        if 'BuyDate' in df.columns: df = df.rename(columns={'BuyDate': 'Date'})
-        if 'Cost' in df.columns: df = df.rename(columns={'Cost': 'Price'})
-        if 'Action' not in df.columns: df['Action'] = 'Buy'
+        # read() 會自動讀取 secrets 裡設定的 spreadsheet URL
+        # ttl=0 代表不快取，每次都抓最新資料
+        df = conn.read(ttl=0)
         
+        # 如果是空的 Sheet，dataframe 可能會是空的，手動建立欄位
+        if df.empty:
+            return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
+            
+        # 資料清洗與型別轉換
+        # 確保欄位存在
         required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
         for col in required_cols:
             if col not in df.columns:
                 if col == "Account": df[col] = "TFSA"
-                elif col == "Date": df[col] = date.today()
+                elif col == "Date": df[col] = str(date.today())
                 else: df[col] = ""
+        
         df = df[required_cols]
+        # 轉換日期
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
         return df
-    except: return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
+    except Exception as e:
+        # 如果連線失敗或 Sheet 是全新的，回傳空表
+        # st.error(f"連線 Google Sheets 失敗: {e}") 
+        return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
+
+def save_data_to_gsheet(df):
+    try:
+        # 寫入資料
+        # 日期轉字串，避免 JSON 序列化錯誤
+        df_save = df.copy()
+        df_save['Date'] = df_save['Date'].astype(str)
+        conn.update(data=df_save)
+        return True
+    except Exception as e:
+        st.error(f"儲存失敗: {e}")
+        return False
 
 def calculate_portfolio(df_transactions):
     if df_transactions.empty: return pd.DataFrame(), 0
@@ -61,7 +85,12 @@ def calculate_portfolio(df_transactions):
     for _, row in df_sorted.iterrows():
         sym = str(row['Symbol']).strip().upper()
         if not sym: continue
-        action, shares, price = row['Action'], float(row['Shares']), float(row['Price'])
+        try:
+            action = row['Action']
+            shares = float(row['Shares'])
+            price = float(row['Price'])
+        except: continue # 跳過格式錯誤的資料
+        
         account = row.get('Account', 'TFSA')
         
         if sym not in holdings: holdings[sym] = {'shares': 0, 'total_cost': 0, 'account': account}
@@ -94,37 +123,20 @@ def get_realtime_price(symbol):
         return hist['Close'].iloc[-1] if not hist.empty else 0
     except: return 0
 
-# ★★★ 新增：Google News RSS 抓取函數 (解決新聞空白問題) ★★★
 def get_stock_news(symbol):
     news_items = []
     try:
-        # 優先嘗試 Google News RSS (穩定且免費)
-        # 針對台灣/中文使用者優化查詢參數
         url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         response = requests.get(url, timeout=5)
-        
         if response.status_code == 200:
             root = ET.fromstring(response.content)
-            # 抓取前 5 則新聞
             for item in root.findall('./channel/item')[:5]:
-                title = item.find('title').text
-                link = item.find('link').text
-                pub_date = item.find('pubDate').text
-                # 簡單格式化日期
-                try:
-                    dt = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S %Z")
-                    date_str = dt.strftime("%Y-%m-%d %H:%M")
-                except:
-                    date_str = pub_date
-                
                 news_items.append({
-                    'title': title,
-                    'link': link,
-                    'date': date_str
+                    'title': item.find('title').text,
+                    'link': item.find('link').text,
+                    'date': item.find('pubDate').text
                 })
-    except Exception as e:
-        print(f"News Error: {e}")
-    
+    except: pass
     return news_items
 
 def draw_k_line(symbol):
@@ -189,40 +201,48 @@ if page == "🏠 資產總覽":
     if st.button("🔄 更新報價", use_container_width=True): st.rerun()
 
     df_trans = load_data()
-    df_inv, realized_pl = calculate_portfolio(df_trans)
+    
+    # 檢查是否讀取成功
+    if df_trans.empty and 'Action' not in df_trans.columns:
+        st.info("👋 歡迎！目前 Google Sheet 是空的。請到「交易紀錄」新增第一筆資料。")
+    else:
+        df_inv, realized_pl = calculate_portfolio(df_trans)
 
-    if not df_inv.empty:
-        total_mkt = 0
-        df_inv['現價'] = 0.0
-        df_inv['市值'] = 0.0
-        df_inv['帳面損益'] = 0.0
-        
-        with st.spinner('同步市場數據...'):
-            for i, row in df_inv.iterrows():
-                p = get_realtime_price(row['代碼'])
-                df_inv.at[i, '現價'] = p
-                df_inv.at[i, '市值'] = p * row['持股']
-                df_inv.at[i, '帳面損益'] = (p - row['均價']) * row['持股']
-        
-        total_mkt = df_inv['市值'].sum()
-        total_unrealized = df_inv['帳面損益'].sum()
-        total_net = realized_pl + total_unrealized
-        
-        c1, c2 = st.columns(2)
-        c1.metric("總市值", f"${total_mkt:,.0f}")
-        c2.metric("淨獲利", f"${total_net:,.0f}", delta_color="normal" if total_net>0 else "inverse")
-        st.caption(f"已實現: ${realized_pl:,.0f} | 帳面: ${total_unrealized:,.0f}")
-        st.divider()
+        if not df_inv.empty:
+            total_mkt = 0
+            df_inv['現價'] = 0.0
+            df_inv['市值'] = 0.0
+            df_inv['帳面損益'] = 0.0
+            
+            with st.spinner('同步市場數據...'):
+                for i, row in df_inv.iterrows():
+                    p = get_realtime_price(row['代碼'])
+                    df_inv.at[i, '現價'] = p
+                    df_inv.at[i, '市值'] = p * row['持股']
+                    df_inv.at[i, '帳面損益'] = (p - row['均價']) * row['持股']
+            
+            total_mkt = df_inv['市值'].sum()
+            total_unrealized = df_inv['帳面損益'].sum()
+            total_net = realized_pl + total_unrealized
+            
+            c1, c2 = st.columns(2)
+            c1.metric("總市值", f"${total_mkt:,.0f}")
+            c2.metric("淨獲利", f"${total_net:,.0f}", delta_color="normal" if total_net>0 else "inverse")
+            st.caption(f"已實現: ${realized_pl:,.0f} | 帳面: ${total_unrealized:,.0f}")
+            st.divider()
 
-        st.write("🔥 持倉明細")
-        df_inv = df_inv.sort_values(by="帳面損益", ascending=False)
-        for _, row in df_inv.iterrows():
-            color = "🟢" if row['帳面損益'] > 0 else "🔴"
-            roi = (row['帳面損益'] / row['總成本'] * 100) if row['總成本']>0 else 0
-            with st.expander(f"{color} {row['代碼']} (${row['現價']:.2f})"):
-                c1, c2 = st.columns(2)
-                c1.metric("市值", f"${row['市值']:,.0f}")
-                c2.metric("損益", f"${row['帳面損益']:,.0f}", f"{roi:.1f}%")
+            st.write("🔥 持倉明細")
+            df_inv = df_inv.sort_values(by="帳面損益", ascending=False)
+            for _, row in df_inv.iterrows():
+                color = "🟢" if row['帳面損益'] > 0 else "🔴"
+                roi = (row['帳面損益'] / row['總成本'] * 100) if row['總成本']>0 else 0
+                with st.expander(f"{color} {row['代碼']} (${row['現價']:.2f})"):
+                    c1, c2 = st.columns(2)
+                    c1.metric("市值", f"${row['市值']:,.0f}")
+                    c2.metric("損益", f"${row['帳面損益']:,.0f}", f"{roi:.1f}%")
+        else:
+            if not df_trans.empty:
+                st.info("已讀取交易紀錄，但目前無庫存 (可能全數賣出)。")
 
 # ==========================================
 # 頁面 2: 🛠️ 投資工具箱
@@ -252,19 +272,16 @@ elif page == "🛠️ 投資工具箱":
                         fig_r = draw_radar(target)
                         if fig_r: st.plotly_chart(fig_r, use_container_width=True)
                     
-                    # ★★★ 新增：新聞摺疊區塊 ★★★
-                    news_items = get_stock_news(target)
-                    st.write("📰 **相關新聞**")
-                    if news_items:
-                        for news in news_items:
-                            # 使用 expander 讓點擊標題展開
-                            with st.expander(f"📅 {news['date']} | {news['title']}"):
-                                st.write("點擊下方連結閱讀全文：")
-                                st.markdown(f"[閱讀全文]({news['link']})")
-                    else:
-                        st.info("暫無新聞，請點擊下方搜尋：")
-                        st.markdown(f"[🔍 Google 搜尋 {target}](https://www.google.com/search?q={target}+stock)")
-
+                    news = get_stock_news(target)
+                    with st.expander("📰 最新新聞", expanded=True):
+                        if news:
+                            for n in news: 
+                                with st.container():
+                                    st.write(f"**{n['title']}**")
+                                    st.caption(f"{n['date']} | [閱讀全文]({n['link']})")
+                        else: 
+                            st.warning("暫無新聞")
+                    
                     sys_prompt = f"分析 {target}。請給出：1. 技術面強弱 2. 基本面評分 3. 操作建議 (短/中/長)。簡短白話。"
                     try:
                         key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
@@ -282,36 +299,23 @@ elif page == "🛠️ 投資工具箱":
             st.info(st.session_state.tool_results["stock_diagnosis"])
             render_followup_chat("diag_chat", st.session_state.tool_results["stock_diagnosis"])
 
-
-    # --- Tab 2: 選股獵人 (含詳細解釋) ---
+    # --- Tab 2: 選股獵人 ---
     with tab2:
         st.write("🤖 AI 自動掃描市場機會")
         strategy = st.selectbox("選擇策略", ["價值抄底 (RSI < 30)", "強勢突破 (站上月線)", "高股息定存"])
         
-        # ★★★ 新增：策略白話文解釋與操作建議 ★★★
         if strategy == "價值抄底 (RSI < 30)":
             with st.container(border=True):
                 st.markdown("### 📉 價值抄底策略")
-                st.write("**這是什麼意思？**")
-                st.caption("股價短時間跌太兇了，市場過度恐慌，就像百貨公司跳樓大拍賣。RSI 指標低於 30 代表「超賣」。")
-                st.write("**💰 操作建議**")
-                st.caption("1. **不要一次梭哈**：因為跌勢可能還沒停，建議分批買進。\n2. **設定停損**：如果買進後再跌 5-10%，先跑再說。")
-        
+                st.write("**定義**：跌深反彈，RSI < 30 (超賣)。\n**建議**：分批低接，設停損。")
         elif strategy == "強勢突破 (站上月線)":
             with st.container(border=True):
                 st.markdown("### 🚀 強勢突破策略")
-                st.write("**這是什麼意思？**")
-                st.caption("股價原本在整理，現在突然衝破關鍵的 20 日均線 (月線)，代表主力資金進場，趨勢轉強。")
-                st.write("**💰 操作建議**")
-                st.caption("1. **順勢交易**：現在氣勢正旺，適合追價買進。\n2. **防守點**：如果股價跌回月線之下，代表假突破，要立刻停損。")
-
+                st.write("**定義**：站上 20MA，趨勢轉強。\n**建議**：順勢買進，破線停損。")
         elif strategy == "高股息定存":
             with st.container(border=True):
                 st.markdown("### 🛡️ 高股息定存策略")
-                st.write("**這是什麼意思？**")
-                st.caption("挑選那些賺錢穩定、每年都大方發錢給股東的好公司 (如可口可樂、銀行股)。")
-                st.write("**💰 操作建議**")
-                st.caption("1. **長期持有**：不用太在意股價每天的漲跌。\n2. **股息再投入**：領到的股息不要花掉，拿去買更多股數，享受複利效果。")
+                st.write("**定義**：穩定配息龍頭股。\n**建議**：定期定額，領息再投入。")
 
         if st.button("🔍 開始掃描", type="primary", use_container_width=True):
             st.caption("模擬掃描黃金池...")
@@ -326,7 +330,6 @@ elif page == "🛠️ 投資工具箱":
                 
                 st.session_state.tool_results["stock_hunter"] = ans
                 st.session_state["hunter_chat"] = []
-
             except: st.error("API Key Error")
 
         if st.session_state.tool_results["stock_hunter"]:
@@ -375,8 +378,11 @@ elif page == "🛠️ 投資工具箱":
 # 頁面 3: 📝 交易紀錄
 # ==========================================
 elif page == "📝 交易紀錄":
-    st.subheader("📝 交易流水帳")
+    st.subheader("📝 交易流水帳 (雲端版)")
+    st.info("資料將儲存於 Google Sheets，不會消失。")
+    
     df_trans = load_data()
+    
     edited_df = st.data_editor(
         df_trans, num_rows="dynamic",
         column_config={
@@ -388,12 +394,10 @@ elif page == "📝 交易紀錄":
             "Shares": st.column_config.NumberColumn("股數"),
         }, use_container_width=True, hide_index=True
     )
-    if st.button("💾 儲存", type="primary", use_container_width=True):
-        save_df = edited_df.copy()
-        save_df['Date'] = save_df['Date'].fillna(date.today())
-        save_df.to_csv(csv_file, index=False)
-        st.success("已更新！")
-        st.rerun()
+    if st.button("💾 儲存並同步至雲端", type="primary", use_container_width=True):
+        if save_data_to_gsheet(edited_df):
+            st.success("✅ 雲端同步成功！")
+            st.rerun()
 
 # ==========================================
 # 頁面 4: 💬 AI 顧問

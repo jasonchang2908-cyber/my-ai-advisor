@@ -5,3 +5,4 @@ openai
 google-generativeai
 plotly
 requests
+st-gsheets-connection
