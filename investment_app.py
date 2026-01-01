@@ -4,7 +4,7 @@ import pandas as pd
 from openai import OpenAI
 import google.generativeai as genai
 import os 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import plotly.graph_objects as go 
 import plotly.express as px 
 import requests 
@@ -19,6 +19,7 @@ if "openai_key" not in st.session_state: st.session_state.openai_key = st.secret
 if "gemini_key" not in st.session_state: st.session_state.gemini_key = st.secrets.get("GEMINI_API_KEY", "")
 if "tool_results" not in st.session_state:
     st.session_state.tool_results = {"stock_diagnosis": None, "stock_hunter": None, "portfolio_check": None}
+if "daily_briefing" not in st.session_state: st.session_state.daily_briefing = None
 
 # --- 3. 側邊選單 ---
 with st.sidebar:
@@ -26,7 +27,7 @@ with st.sidebar:
     page = st.radio("前往", ["🏠 資產總覽", "🛠️ 投資工具箱", "📝 交易紀錄", "💬 AI 顧問", "⚙️ 設定"])
     st.divider()
     ai_model = st.selectbox("AI 模型", ["Gemini", "OpenAI"])
-    st.caption("V19.0 USD Standard")
+    st.caption("V22.0 Payback Projector")
 
 # --- 4. 核心邏輯 (Google Sheets) ---
 try:
@@ -42,12 +43,10 @@ except ImportError:
     st.stop()
 
 def load_data():
-    if not CONNECTION_STATUS:
-        return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
+    if not CONNECTION_STATUS: return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
     try:
         df = conn.read(ttl=0)
         if df.empty: return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
-        
         required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
         for col in required_cols:
             if col not in df.columns:
@@ -66,9 +65,7 @@ def save_data_to_gsheet(df):
         df_save['Date'] = df_save['Date'].astype(str)
         conn.update(data=df_save)
         return True
-    except Exception as e:
-        st.error(f"儲存失敗: {e}")
-        return False
+    except: return False
 
 def load_local_csv():
     local_file = 'my_portfolio.csv'
@@ -96,7 +93,6 @@ def scan_missing_dividends(df_trans):
     missing_dividends = []
     recorded_divs = df_trans[df_trans['Action'] == 'Dividend']
     progress_text = st.empty()
-    
     for sym in symbols:
         sym = str(sym).strip().upper()
         if not sym: continue
@@ -107,7 +103,6 @@ def scan_missing_dividends(df_trans):
             if div_history.empty: continue
             start_date = pd.Timestamp.now(tz=div_history.index.tz) - pd.DateOffset(years=2)
             recent_divs = div_history[div_history.index >= start_date]
-            
             for div_date, div_amount in recent_divs.items():
                 div_date_date = div_date.date()
                 past_trans = df_trans[(df_trans['Symbol'] == sym) & (df_trans['Date'] < div_date_date)]
@@ -119,7 +114,6 @@ def scan_missing_dividends(df_trans):
                         account_map = row['Account']
                     elif row['Action'] == 'Sell':
                         shares_held -= float(row['Shares'])
-                
                 if shares_held > 0:
                     total_payout = shares_held * div_amount
                     is_recorded = False
@@ -130,12 +124,9 @@ def scan_missing_dividends(df_trans):
                             break
                     if not is_recorded:
                         missing_dividends.append({
-                            "Date": div_date_date,
-                            "Account": account_map if account_map else "TFSA",
-                            "Action": "Dividend",
-                            "Symbol": sym,
-                            "Price": round(total_payout, 2),
-                            "Shares": 1,
+                            "Date": div_date_date, "Account": account_map if account_map else "TFSA",
+                            "Action": "Dividend", "Symbol": sym,
+                            "Price": round(total_payout, 2), "Shares": 1,
                             "Info": f"US${div_amount} x {shares_held} 股"
                         })
         except: pass
@@ -147,18 +138,18 @@ def calculate_portfolio(df_transactions):
     holdings = {}
     realized_pl = 0
     total_dividend = 0 
-    df_sorted = df_transactions.sort_values(by="Date")
     
+    # 用來記錄個別股票的股息累計
+    stock_dividends = {} 
+
+    df_sorted = df_transactions.sort_values(by="Date")
     for _, row in df_sorted.iterrows():
         sym = str(row['Symbol']).strip().upper()
         if not sym: continue
         try:
-            action = row['Action']
-            shares = float(row['Shares'])
-            price = float(row['Price'])
+            action, shares, price = row['Action'], float(row['Shares']), float(row['Price'])
         except: continue 
         account = row.get('Account', 'TFSA')
-        
         if sym not in holdings: holdings[sym] = {'shares': 0, 'total_cost': 0, 'account': account}
         
         if action == 'Buy':
@@ -171,50 +162,52 @@ def calculate_portfolio(df_transactions):
                 realized_pl += (price - avg_cost) * shares
                 holdings[sym]['shares'] -= shares
                 holdings[sym]['total_cost'] -= (shares * avg_cost)
-        elif action == 'Dividend':
-            total_dividend += (price * shares)
+        elif action == 'Dividend': 
+            amt = price * shares
+            total_dividend += amt
+            # 累計該股票的股息
+            stock_dividends[sym] = stock_dividends.get(sym, 0) + amt
 
     final_data = []
     for sym, data in holdings.items():
         if data['shares'] > 0.001:
             final_data.append({
                 "帳戶": data['account'], "代碼": sym, "持股": data['shares'],
-                "總成本": data['total_cost'], "均價": data['total_cost']/data['shares']
+                "總成本": data['total_cost'], "均價": data['total_cost']/data['shares'],
+                "已領股息": stock_dividends.get(sym, 0) # 加入已領股息欄位
             })
     return pd.DataFrame(final_data), realized_pl, total_dividend
 
-# ★★★ 新增：智能匯率轉換價格獲取 ★★★
-# 這個函數保證回傳的價格一定是 USD
 def get_usd_price(symbol):
     try:
         stock = yf.Ticker(symbol)
         hist = stock.history(period="1d")
         if hist.empty: return 0
-        
         raw_price = hist['Close'].iloc[-1]
-        
-        # 判斷是否需要換匯 (台股 .TW 或 加股 .TO)
-        if symbol.endswith(".TW"):
-            # 獲取 TWD -> USD 匯率
-            fx = yf.Ticker("TWDUSD=X").history(period="1d")['Close'].iloc[-1]
-            return raw_price * fx
-        
-        elif symbol.endswith(".TO"):
-            # 獲取 CAD -> USD 匯率
-            fx = yf.Ticker("CADUSD=X").history(period="1d")['Close'].iloc[-1]
-            return raw_price * fx
-        
-        # 預設已經是美股 USD
+        if symbol.endswith(".TW"): return raw_price * yf.Ticker("TWDUSD=X").history(period="1d")['Close'].iloc[-1]
+        elif symbol.endswith(".TO"): return raw_price * yf.Ticker("CADUSD=X").history(period="1d")['Close'].iloc[-1]
         return raw_price
-        
     except: return 0
 
-# 新增：獲取 USD -> CAD 匯率 (給首頁參考用)
-@st.cache_data(ttl=3600) # 快取一小時
-def get_usdcad_rate():
+# ★★★ 新增：獲取年配息率以估算回本時間 ★★★
+def get_annual_dividend_rate(symbol):
     try:
-        return yf.Ticker("CAD=X").history(period="1d")['Close'].iloc[-1]
-    except: return 1.35 # 預設值防止錯誤
+        stock = yf.Ticker(symbol)
+        # 嘗試直接獲取年配息金額
+        div_rate = stock.info.get('dividendRate')
+        if div_rate: return div_rate
+        
+        # 如果抓不到，用過去一年配息總和估算
+        divs = stock.dividends
+        one_year_ago = pd.Timestamp.now(tz=divs.index.tz) - pd.DateOffset(years=1)
+        last_year_divs = divs[divs.index >= one_year_ago]
+        return last_year_divs.sum()
+    except: return 0
+
+@st.cache_data(ttl=3600)
+def get_usdcad_rate():
+    try: return yf.Ticker("CAD=X").history(period="1d")['Close'].iloc[-1]
+    except: return 1.35
 
 def get_stock_news(symbol):
     news_items = []
@@ -227,6 +220,39 @@ def get_stock_news(symbol):
                 news_items.append({'title': item.find('title').text, 'link': item.find('link').text, 'date': item.find('pubDate').text})
     except: pass
     return news_items
+
+def forecast_next_month_dividends(df_inventory):
+    forecast = []
+    total_estimated = 0
+    today = date.today()
+    next_month = today + timedelta(days=30)
+    progress = st.empty()
+    for _, row in df_inventory.iterrows():
+        sym = row['代碼']
+        shares = row['持股']
+        if shares <= 0: continue
+        progress.caption(f"🔮 正在預測 {sym} 未來派息...")
+        try:
+            stock = yf.Ticker(sym)
+            divs = stock.dividends
+            if divs.empty: continue
+            last_div_date = divs.index[-1].date()
+            last_div_amount = divs.iloc[-1]
+            if len(divs) >= 2:
+                prev_div_date = divs.index[-2].date()
+                days_diff = (last_div_date - prev_div_date).days
+                next_div_date = last_div_date + timedelta(days=days_diff)
+                while next_div_date < today: next_div_date += timedelta(days=days_diff)
+                if today <= next_div_date <= next_month:
+                    est_amount = last_div_amount * shares
+                    forecast.append({
+                        "代碼": sym, "預測除息日": next_div_date,
+                        "預估配息": last_div_amount, "預估收入 (USD)": est_amount
+                    })
+                    total_estimated += est_amount
+        except: pass
+    progress.empty()
+    return pd.DataFrame(forecast), total_estimated
 
 def draw_k_line(symbol):
     try:
@@ -256,29 +282,26 @@ def draw_radar(symbol):
         return fig
     except: return None
 
-def render_followup_chat(context_key, context_text):
-    st.write("---")
-    st.caption("🗣️ 與顧問討論此建議")
-    if context_key not in st.session_state: st.session_state[context_key] = []
-    for msg in st.session_state[context_key]:
-        with st.chat_message(msg["role"]): st.markdown(msg["content"])
-    if prompt := st.chat_input(f"有疑問嗎？", key=f"input_{context_key}"):
-        st.session_state[context_key].append({"role": "user", "content": prompt})
-        with st.chat_message("user"): st.markdown(prompt)
-        with st.chat_message("assistant"):
-            with st.spinner("顧問思考中..."):
-                full_prompt = f"背景：{context_text}\n用戶問：{prompt}\n請回答。"
-                try:
-                    key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
-                    if not key: ans = "請先設定 API Key"
-                    elif "OpenAI" in ai_model:
-                        ans = OpenAI(api_key=key).chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":full_prompt}]).choices[0].message.content
-                    else:
-                        genai.configure(api_key=key)
-                        ans = genai.GenerativeModel('gemini-2.5-flash').generate_content(full_prompt).text
-                except Exception as e: ans = str(e)
-                st.markdown(ans)
-                st.session_state[context_key].append({"role": "assistant", "content": ans})
+def generate_briefing(df_inventory, total_net):
+    summary = df_inventory[['代碼', '市值', '帳面損益']].to_dict('records')
+    prompt = f"""
+    你是用戶的 AI 投資秘書。今天是 {date.today()}。
+    1. 【持倉診斷】：用戶總資產淨值 US$ {total_net:,.0f}。持倉明細：{summary}。
+       請簡短指出哪支股票表現最好，哪支最差，並提醒是否有過度集中風險。
+    2. 【今日市場雷達】：請根據目前全球股市趨勢 (美股為主)，
+       推薦 3 檔「今日值得關注」的股票或 ETF。
+    請用 Markdown 格式，加上 Emoji，語氣專業但親切。總字數 300 字以內。
+    """
+    try:
+        key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
+        if not key: return "⚠️ 請先在設定頁面輸入 API Key"
+        if "OpenAI" in ai_model:
+            ans = OpenAI(api_key=key).chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":prompt}]).choices[0].message.content
+        else:
+            genai.configure(api_key=key)
+            ans = genai.GenerativeModel('gemini-2.5-flash').generate_content(prompt).text
+        return ans
+    except Exception as e: return f"AI 發生錯誤: {str(e)}"
 
 # ==========================================
 # 頁面 1: 🏠 資產總覽
@@ -289,12 +312,30 @@ if page == "🏠 資產總覽":
     if not CONNECTION_STATUS:
         st.error("⚠️ 無法連線至 Google Sheets，請檢查 secrets.toml。")
     else:
-        if st.button("🔄 更新報價 (USD)", use_container_width=True): st.rerun()
+        with st.container(border=True):
+            st.markdown("### 🌞 智能晨間戰報")
+            if st.session_state.daily_briefing is None:
+                if st.button("✨ 生成今日分析", use_container_width=True):
+                    temp_df = load_data()
+                    if not temp_df.empty:
+                        t_inv, t_pl, t_div = calculate_portfolio(temp_df)
+                        for i, r in t_inv.iterrows():
+                            t_inv.at[i, '市值'] = get_usd_price(r['代碼']) * r['持股']
+                            t_inv.at[i, '帳面損益'] = (t_inv.at[i, '市值'] / r['持股'] - r['均價']) * r['持股']
+                        total_net_val = t_pl + t_inv['帳面損益'].sum() + t_div
+                        with st.spinner("AI 正在閱讀市場新聞..."):
+                            briefing = generate_briefing(t_inv, total_net_val)
+                            st.session_state.daily_briefing = briefing
+                            st.rerun()
+                    else: st.warning("請先新增交易紀錄。")
+            if st.session_state.daily_briefing:
+                st.markdown(st.session_state.daily_briefing)
+                if st.button("🔄 重新分析"): st.session_state.daily_briefing = None; st.rerun()
+
+        if st.button("🔄 更新即時報價", use_container_width=True): st.rerun()
 
         df_trans = load_data()
-        
-        if df_trans.empty:
-            st.info("👋 連線成功！雲端目前是空的。")
+        if df_trans.empty: st.info("👋 連線成功！雲端目前是空的。")
         else:
             df_inv, realized_pl, total_dividends = calculate_portfolio(df_trans)
 
@@ -306,7 +347,6 @@ if page == "🏠 資產總覽":
                 
                 with st.spinner('同步美金匯率與股價...'):
                     for i, row in df_inv.iterrows():
-                        # 使用 get_usd_price 確保回傳美金價格
                         p = get_usd_price(row['代碼'])
                         df_inv.at[i, '現價'] = p
                         df_inv.at[i, '市值'] = p * row['持股']
@@ -315,24 +355,26 @@ if page == "🏠 資產總覽":
                 total_mkt = df_inv['市值'].sum()
                 total_unrealized = df_inv['帳面損益'].sum()
                 total_net = realized_pl + total_unrealized + total_dividends
-                
-                # 獲取加幣匯率參考
                 usdcad = get_usdcad_rate()
                 
-                # --- 主儀表板 ---
-                st.container(border=True).metric(
-                    "總資產淨值 (USD)", 
-                    f"US$ {total_mkt:,.0f}", 
-                    f"US$ {total_net:,.0f} (Net Profit)"
-                )
+                st.container(border=True).metric("總資產淨值 (USD)", f"US$ {total_mkt:,.0f}", f"US$ {total_net:,.0f} (Net Profit)")
+                st.caption(f"🇨🇦 約合加幣: CAD$ {total_mkt * usdcad:,.0f}")
                 
-                # 加幣參考小字
-                st.caption(f"🇨🇦 約合加幣: CAD$ {total_mkt * usdcad:,.0f} (匯率 {usdcad:.2f})")
+                st.divider()
+                st.markdown("### 🔮 下個月現金流預測")
+                if st.button("查看預測", use_container_width=True):
+                    with st.spinner("正在推算每支股票的配息週期..."):
+                        df_forecast, est_income = forecast_next_month_dividends(df_inv)
+                        if not df_forecast.empty:
+                            col_f1, col_f2 = st.columns([1, 2])
+                            col_f1.metric("預估收入", f"US$ {est_income:.2f}")
+                            col_f2.dataframe(df_forecast[['代碼', '預測除息日', '預估收入 (USD)']], hide_index=True)
+                        else: st.info("未來 30 天內，您的持倉預計沒有配息。")
                 
                 st.divider()
                 col_a, col_b, col_c = st.columns(3)
                 col_a.metric("已落袋", f"US$ {realized_pl:,.0f}")
-                col_b.metric("💰 股息", f"US$ {total_dividends:,.0f}")
+                col_b.metric("💰 累計股息", f"US$ {total_dividends:,.0f}")
                 col_c.metric("帳面", f"US$ {total_unrealized:,.0f}")
                 
                 st.divider()
@@ -341,10 +383,36 @@ if page == "🏠 資產總覽":
                 for _, row in df_inv.iterrows():
                     color = "🟢" if row['帳面損益'] > 0 else "🔴"
                     roi = (row['帳面損益'] / row['總成本'] * 100) if row['總成本']>0 else 0
+                    
+                    # ★★★ 計算回本年限 ★★★
+                    annual_div_per_share = get_annual_dividend_rate(row['代碼'])
+                    annual_income = annual_div_per_share * row['持股']
+                    received_div = row['已領股息']
+                    remaining_cost = row['總成本'] - received_div
+                    
+                    years_to_breakeven = 999
+                    if annual_income > 0:
+                        years_to_breakeven = remaining_cost / annual_income
+                    
+                    payback_pct = min(received_div / row['總成本'], 1.0) if row['總成本'] > 0 else 0
+
                     with st.expander(f"{color} {row['代碼']} (US${row['現價']:.2f})"):
                         c1, c2 = st.columns(2)
                         c1.metric("市值", f"US$ {row['市值']:,.0f}")
                         c2.metric("損益", f"US$ {row['帳面損益']:,.0f}", f"{roi:.1f}%")
+                        
+                        st.markdown("---")
+                        st.markdown(f"**⏳ 零成本回本進度 (已領 US$ {received_div:,.0f})**")
+                        st.progress(payback_pct)
+                        
+                        if remaining_cost <= 0:
+                            st.success("🎉 恭喜！此股票已達成「零成本」(Free Ride)！")
+                        elif annual_income > 0:
+                            st.caption(f"預估年配息: US$ {annual_income:,.2f} | 剩餘成本: US$ {remaining_cost:,.2f}")
+                            st.info(f"🚀 預計再領 **{years_to_breakeven:.1f} 年** 股息可完全回本")
+                        else:
+                            st.caption("此股票目前無配息，無法計算回本年限。")
+
             else:
                 st.info("無庫存。")
                 if total_dividends > 0: st.metric("💰 歷史累計股息", f"US$ {total_dividends:,.0f}")
@@ -421,7 +489,6 @@ elif page == "🛠️ 投資工具箱":
     with tab3:
         df_inv, _, _ = calculate_portfolio(load_data())
         if not df_inv.empty:
-            # 這裡也要用 get_usd_price
             for i, r in df_inv.iterrows(): df_inv.at[i, '市值'] = get_usd_price(r['代碼']) * r['持股']
             st.write("📊 帳戶配置 (USD)")
             fig = px.pie(df_inv, values='市值', names='帳戶', hole=0.4)
