@@ -278,17 +278,26 @@ def scan_technical_signals(df_inventory):
         except: pass
     return signals
 
-def generate_briefing(df_inventory, total_net):
+# ★★★ 修正後的 generate_briefing (接收正確的總市值與獲利) ★★★
+def generate_briefing(df_inventory, total_mkt_val, total_profit):
     tech_signals = scan_technical_signals(df_inventory)
     signals_text = "\n".join(tech_signals) if tech_signals else "目前無明顯極端訊號"
     summary = df_inventory[['代碼', '市值', '帳面損益']].to_dict('records')
     prompt = f"""
     你是 AI 投資總監。今天是 {date.today()}。
+    
     【市場與持倉數據】：
-    - 用戶總資產：US$ {total_net:,.0f}
+    - **用戶總資產市值**：US$ {total_mkt_val:,.0f} (這是目前的股票總值)
+    - **整體淨獲利**：US$ {total_profit:,.0f}
     - 持倉狀態：{summary}
     - **技術面掃描訊號**：{signals_text}
-    請撰寫【晨間戰報】：1. 持倉健檢 2. 🎯 今日焦點買入 3. ⚠️ 今日風險警示。Markdown格式。
+    
+    請撰寫【晨間戰報】：
+    1. **持倉健檢**：簡單點評目前的持倉風險(請引用正確的總資產數據)。
+    2. **🎯 今日焦點買入**：根據技術訊號或市場趨勢，推薦 1-2 檔「買進/加碼」標的。
+    3. **⚠️ 今日風險警示**：推薦 1-2 檔「賣出/減碼」標的。
+    
+    請用 Markdown 格式，加上 Emoji。
     """
     try:
         key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
@@ -301,7 +310,6 @@ def generate_briefing(df_inventory, total_net):
         return ans
     except Exception as e: return f"AI 發生錯誤: {str(e)}"
 
-# 下面的繪圖函式保持不變
 def draw_k_line(symbol):
     try:
         stock = yf.Ticker(symbol)
@@ -389,25 +397,16 @@ with st.sidebar:
         else:
             system_context = "無法連線資料庫。"
 
-        # 2. 顯示聊天歷史 (簡化版 UI)
         for msg in st.session_state.messages:
-            # 為了省空間，用 text 顯示
             role_icon = "👤" if msg["role"] == "user" else "🤖"
             st.markdown(f"**{role_icon}** {msg['content']}")
 
-        # 3. 輸入框
         if prompt := st.chat_input("問我任何事..."):
             st.session_state.messages.append({"role": "user", "content": prompt})
-            st.rerun() # 強制刷新以顯示使用者問題
+            st.rerun()
 
-# --- 處理 AI 回覆 (在主畫面刷新後執行) ---
+# --- 處理 AI 回覆 ---
 if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-    # 這是為了讓 input 在 sidebar，但回應邏輯在全域執行
-    last_prompt = st.session_state.messages[-1]["content"]
-    
-    # 這裡我們不顯示在主畫面，而是寫入 history 讓 sidebar 顯示
-    # 但因為 sidebar 已經 render 完了，所以需要一個 spinner 佔位
-    
     try:
         key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
         if not key:
@@ -419,18 +418,13 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
             ans = OpenAI(api_key=key).chat.completions.create(model="gpt-4o", messages=messages).choices[0].message.content
         else:
             genai.configure(api_key=key)
-            # Gemini 簡單串接
             full_prompt = system_context + "\n\n用戶歷史對話:\n" + "\n".join([m['content'] for m in st.session_state.messages])
             ans = genai.GenerativeModel('gemini-2.5-flash').generate_content(full_prompt).text
     except Exception as e:
         ans = f"錯誤: {str(e)}"
     
     st.session_state.messages.append({"role": "assistant", "content": ans})
-    st.rerun() # 再次刷新，讓 AI 回覆出現在 Sidebar
-
-# ==========================================
-# 主頁面邏輯 (已移除獨立的 AI 顧問頁面)
-# ==========================================
+    st.rerun()
 
 # ==========================================
 # 頁面 1: 🏠 資產總覽
@@ -446,12 +440,23 @@ if page == "🏠 資產總覽":
                     temp_df = load_data()
                     if not temp_df.empty:
                         t_inv, t_pl, t_div = calculate_portfolio(temp_df)
+                        
+                        # ★★★ 修正點：在呼叫 AI 前，先算出正確的總市值 ★★★
+                        current_total_mkt = 0
                         for i, r in t_inv.iterrows():
-                            t_inv.at[i, '市值'] = get_usd_price(r['代碼']) * r['持股']
-                            t_inv.at[i, '帳面損益'] = (t_inv.at[i, '市值'] / r['持股'] - r['均價']) * r['持股']
-                        total_net_val = t_pl + t_inv['帳面損益'].sum() + t_div
+                            p = get_usd_price(r['代碼'])
+                            mkt = p * r['持股']
+                            t_inv.at[i, '現價'] = p
+                            t_inv.at[i, '市值'] = mkt
+                            t_inv.at[i, '帳面損益'] = (mkt / r['持股'] - r['均價']) * r['持股'] if r['持股'] > 0 else 0
+                            current_total_mkt += mkt
+                        
+                        # 算出總獲利 (已實現+帳面+股息)
+                        total_profit_val = t_pl + t_inv['帳面損益'].sum() + t_div
+                        
                         with st.spinner("AI 正在計算技術指標..."):
-                            briefing = generate_briefing(t_inv, total_net_val)
+                            # 傳入正確參數
+                            briefing = generate_briefing(t_inv, current_total_mkt, total_profit_val)
                             st.session_state.daily_briefing = briefing
                             st.rerun()
                     else: st.warning("請先新增交易紀錄。")
