@@ -425,7 +425,7 @@ def draw_radar(symbol):
     except: return None
 
 # ==========================================
-# 側邊欄：登入 & 導航 (V31.1: 新增書籤生成器)
+# 側邊欄：登入 & 導航
 # ==========================================
 with st.sidebar:
     st.header("📱 指揮中心")
@@ -760,6 +760,11 @@ elif page == "🛠️ 投資工具箱":
         if st.session_state.user_role == "Admin":
             df_inv, _, _ = calculate_portfolio(load_data())
             if not df_inv.empty:
+                # --- FIX: 先計算市值，避免 px.pie 崩潰 ---
+                with st.spinner("正在更新最新市值以繪製圖表..."):
+                    for i, row in df_inv.iterrows():
+                        p = get_usd_price(row['代碼'])
+                        df_inv.at[i, '市值'] = p * row['持股']
                 st.write("📊 帳戶配置")
                 st.plotly_chart(px.pie(df_inv, values='市值', names='帳戶', hole=0.4), use_container_width=True)
             else: st.warning("無庫存")
@@ -809,7 +814,7 @@ elif (page == "📝 交易紀錄" or page == "⚙️ 設定") and st.session_sta
         
         # 取得當前基礎網址 (這需要部署後才準確，本地端先用 localhost)
         # 這裡我們做一個通用的生成邏輯
-        base_url = "https://您的App網址.streamlit.app" # 提示用戶替換
+        base_url = "https://my-ai-advisor.streamlit.app" # 提示用戶替換
         magic_link = f"{base_url}/?auth={ADMIN_PASSWORD}"
         
         st.code(magic_link, language="text")
