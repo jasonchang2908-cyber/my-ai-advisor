@@ -264,11 +264,15 @@ def scan_technical_signals(df_inventory):
             ma20 = df['MA20'].iloc[-1]
             status = "盤整"
             note = ""
-            if current_rsi < 30: status = "超賣(Buy)"; note = f"RSI={current_rsi:.1f} 低檔"
-            elif current_rsi > 70: status = "超買(Sell)"; note = f"RSI={current_rsi:.1f} 過熱"
+            if current_rsi < 30: 
+                status = "超賣(Buy)"
+                note = f"RSI={current_rsi:.1f} 低檔鈍化"
+            elif current_rsi > 70: 
+                status = "超買(Sell)"
+                note = f"RSI={current_rsi:.1f} 過熱警戒"
             dist_ma = (current_price - ma20) / ma20 * 100
-            if dist_ma > 15: note += f", 乖離率過大"
-            if dist_ma < -10: note += f", 跌深乖離"
+            if dist_ma > 15: note += f", 乖離率過大({dist_ma:.1f}%)"
+            if dist_ma < -10: note += f", 跌深乖離({dist_ma:.1f}%)"
             if status != "盤整" or abs(dist_ma) > 10:
                 signals.append(f"{sym}: 現價{current_price:.1f}, {status}, {note}")
         except: pass
@@ -280,12 +284,19 @@ def generate_briefing(df_inventory, total_mkt_val, total_profit):
     summary = df_inventory[['代碼', '市值', '帳面損益']].to_dict('records')
     prompt = f"""
     你是 AI 投資總監。今天是 {date.today()}。
+    
     【市場與持倉數據】：
-    - **用戶總資產市值**：US$ {total_mkt_val:,.0f}
+    - **用戶總資產市值**：US$ {total_mkt_val:,.0f} (這是目前的股票總值)
     - **整體淨獲利**：US$ {total_profit:,.0f}
     - 持倉狀態：{summary}
     - **技術面掃描訊號**：{signals_text}
-    請撰寫【晨間戰報】：1. 持倉健檢 2. 🎯 今日焦點買入 3. ⚠️ 今日風險警示。Markdown格式。
+    
+    請撰寫【晨間戰報】：
+    1. **持倉健檢**：簡單點評目前的持倉風險(請引用正確的總資產數據)。
+    2. **🎯 今日焦點買入**：根據技術訊號或市場趨勢，推薦 1-2 檔「買進/加碼」標的。
+    3. **⚠️ 今日風險警示**：推薦 1-2 檔「賣出/減碼」標的。
+    
+    請用 Markdown 格式，加上 Emoji。
     """
     try:
         key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
@@ -298,11 +309,11 @@ def generate_briefing(df_inventory, total_mkt_val, total_profit):
         return ans
     except Exception as e: return f"AI 發生錯誤: {str(e)}"
 
-# --- ★★★ V27.0 策略回測核心 ★★★ ---
+# --- 策略回測核心 ---
 def run_backtest(symbol, strategy):
     try:
         stock = yf.Ticker(symbol)
-        df = stock.history(period="1y") # 回測一年
+        df = stock.history(period="1y") 
         if len(df) < 50: return None, "資料不足"
         
         df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -315,12 +326,10 @@ def run_backtest(symbol, strategy):
         position = 0
         trades = []
         
-        # 簡易回測迴圈
         for i in range(200, len(df)):
             price = df['Close'].iloc[i]
             date_idx = df.index[i]
-            
-            signal = 0 # 0:hold, 1:buy, -1:sell
+            signal = 0 
             reason = ""
             
             if strategy == "黃金交叉 (MA50 > MA200)":
@@ -333,7 +342,6 @@ def run_backtest(symbol, strategy):
                 if df['RSI'].iloc[i] < 30: signal = 1; reason = "RSI 超賣"
                 elif df['RSI'].iloc[i] > 70: signal = -1; reason = "RSI 超買"
             
-            # 執行交易 (全倉買賣)
             if signal == 1 and cash > 0:
                 position = cash / price
                 cash = 0
@@ -343,42 +351,29 @@ def run_backtest(symbol, strategy):
                 position = 0
                 trades.append({'Date': date_idx, 'Type': 'Sell', 'Price': price, 'Reason': reason})
                 
-        # 結算
         final_value = cash + (position * df['Close'].iloc[-1])
         roi = (final_value - initial_capital) / initial_capital * 100
         buy_hold_roi = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
         
         return {
-            'roi': roi, 
-            'buy_hold_roi': buy_hold_roi, 
-            'trades': trades, 
-            'win': roi > 0,
-            'better_than_hold': roi > buy_hold_roi,
-            'df': df # 回傳 DF 供畫圖
+            'roi': roi, 'buy_hold_roi': buy_hold_roi, 'trades': trades, 
+            'win': roi > 0, 'better_than_hold': roi > buy_hold_roi, 'df': df 
         }, "Success"
         
     except Exception as e: return None, str(e)
 
-# 繪製回測圖表
 def draw_backtest_chart(symbol, res):
     df = res['df']
     trades = res['trades']
-    
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name='股價'))
-    
-    # 標示買賣點
     buy_x, buy_y = [], []
     sell_x, sell_y = [], []
     for t in trades:
-        if t['Type'] == 'Buy':
-            buy_x.append(t['Date']); buy_y.append(t['Price'])
-        else:
-            sell_x.append(t['Date']); sell_y.append(t['Price'])
-            
+        if t['Type'] == 'Buy': buy_x.append(t['Date']); buy_y.append(t['Price'])
+        else: sell_x.append(t['Date']); sell_y.append(t['Price'])
     fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode='markers', marker_symbol='triangle-up', marker_color='green', marker_size=12, name='買進'))
     fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode='markers', marker_symbol='triangle-down', marker_color='red', marker_size=12, name='賣出'))
-    
     fig.update_layout(title=f"{symbol} 策略回測圖", height=400)
     return fig
 
@@ -593,7 +588,7 @@ if page == "🏠 資產總覽":
             else: st.info("無庫存。")
 
 # ==========================================
-# 頁面 2: 🛠️ 投資工具箱 (新增策略回測)
+# 頁面 2: 🛠️ 投資工具箱
 # ==========================================
 elif page == "🛠️ 投資工具箱":
     st.subheader("🛠️ 投資工具箱")
@@ -602,7 +597,7 @@ elif page == "🛠️ 投資工具箱":
     df_trans = load_data()
     my_stocks = df_trans['Symbol'].unique().tolist() if not df_trans.empty else []
     
-    # --- 新增：策略回測實驗室 ---
+    # --- 新增：策略回測實驗室 (含操作手冊) ---
     with tab1:
         st.markdown("### 🤖 AI 策略回測實驗室")
         st.caption("驗證策略在過去一年的表現，別再憑感覺下單。")
@@ -613,7 +608,20 @@ elif page == "🛠️ 投資工具箱":
             inp_s = st.text_input("或輸入代號 (如 2330.TW)", value=sel_s)
         with c2:
             strategy = st.selectbox("選擇策略", ["黃金交叉 (MA50 > MA200)", "RSI 極限反轉 (30/70)"])
+
+        # ★★★ 新增：策略操作手冊 (摺疊區塊) ★★★
+        with st.expander("📖 策略操作手冊 (忘記怎麼看時點我)", expanded=True):
+            st.markdown("### 🚦 必勝口訣：先看成績，再看訊號")
             
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.info(f"**步驟 1：檢查教練是否合格**\n\n回測跑完後，請務必查看 **「勝過大盤?」**\n\n- ✅ **是**：代表這策略有效，請相信它。\n- ❌ **否**：代表這策略不準，**請忽略訊號，長期持有就好。**")
+            with col_b:
+                if "黃金交叉" in strategy:
+                    st.success("**步驟 2：看圖找買賣點 (趨勢型)**\n\n- 🟢 **綠色三角形**：黃金交叉 (短期穿過長期)，**趨勢向上，買進！**\n- 🔴 **紅色三角形**：死亡交叉 (短期跌破長期)，**趨勢向下，賣出！**")
+                else:
+                    st.success("**步驟 2：看圖找買賣點 (反轉型)**\n\n- 🟢 **綠色三角形**：RSI < 30 (超賣)，**現在太便宜，撿便宜！**\n- 🔴 **紅色三角形**：RSI > 70 (超買)，**現在太貴了，快逃頂！**")
+        
         target = inp_s.upper().strip()
         
         if st.button("🚀 開始回測", type="primary", use_container_width=True):
