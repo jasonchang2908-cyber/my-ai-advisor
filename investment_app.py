@@ -40,21 +40,17 @@ except ImportError:
     st.error("⚠️ 嚴重錯誤：缺少套件。請在終端機執行 `pip install st-gsheets-connection`")
     st.stop()
 
-# --- V31.0 新增：設定檔讀取與寫入 (Config Management) ---
+# --- Config Management ---
 def load_config():
-    """從 Google Sheets 讀取設定，如果沒有就預設關閉訪客模式"""
     if not CONNECTION_STATUS: return {"guest_mode": False}
     try:
-        # 嘗試讀取名為 'config' 的工作表，如果不存在會報錯，我們就用預設值
         df_config = conn.read(worksheet="config", ttl=0)
         if not df_config.empty and "guest_mode" in df_config.columns:
             return {"guest_mode": bool(df_config.iloc[0]["guest_mode"])}
-    except:
-        pass
-    return {"guest_mode": False} # 預設關閉
+    except: pass
+    return {"guest_mode": False} 
 
 def save_config(guest_mode_status):
-    """將設定寫入 Google Sheets"""
     if not CONNECTION_STATUS: return False
     try:
         df = pd.DataFrame([{"guest_mode": guest_mode_status}])
@@ -62,14 +58,13 @@ def save_config(guest_mode_status):
         return True
     except: return False
 
-# 載入設定
 APP_CONFIG = load_config()
 
 def load_data():
     if st.session_state.user_role != "Admin": return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
     if not CONNECTION_STATUS: return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
     try:
-        df = conn.read(ttl=0) # 預設讀取第一個工作表 (交易紀錄)
+        df = conn.read(ttl=0) 
         if df.empty: return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
         required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
         for col in required_cols:
@@ -88,7 +83,7 @@ def save_data_to_gsheet(df):
     try:
         df_save = df.copy()
         df_save['Date'] = df_save['Date'].astype(str)
-        conn.update(data=df_save) # 更新主工作表
+        conn.update(data=df_save) 
         return True
     except: return False
 
@@ -430,25 +425,22 @@ def draw_radar(symbol):
     except: return None
 
 # ==========================================
-# 側邊欄：登入 & 導航 (V31.0: 增加訪客開關)
+# 側邊欄：登入 & 導航 (V31.1: 新增書籤生成器)
 # ==========================================
 with st.sidebar:
     st.header("📱 指揮中心")
     query_params = st.query_params
     auth_token = query_params.get("auth", "")
     
-    # 檢查是否啟用訪客模式 (從 Config 讀取)
     is_guest_mode_active = APP_CONFIG.get("guest_mode", False)
     
     # --- 登入邏輯 ---
     if st.session_state.user_role is None:
-        # 1. 魔法連結 (最高優先級)
         if auth_token == ADMIN_PASSWORD:
             st.session_state.user_role = "Admin"
             st.toast(f"🔑 魔法連結驗證成功！", icon="🚀")
             st.rerun()
             
-        # 2. 一般登入介面
         st.info("🔒 請登入")
         pwd = st.text_input("輸入密碼", type="password")
         
@@ -468,7 +460,6 @@ with st.sidebar:
                     else:
                         st.error("密碼錯誤")
         
-        # 顯示目前訪客狀態
         if not is_guest_mode_active:
             st.caption("🚫 訪客模式：已停用")
         else:
@@ -732,23 +723,21 @@ elif page == "🛠️ 投資工具箱":
         strategy = st.selectbox("掃描策略", ["價值抄底 (RSI < 30)", "強勢突破 (站上月線)"])
         if st.button("🔍 掃描"): st.info("模擬掃描中... (需連接付費數據源)")
 
-    # --- Tab 5: 相關性熱圖 (Admin & Guest if active) ---
+    # --- Tab 5: 相關性熱圖 ---
     with tab5:
-        if st.session_state.user_role == "Admin":
-            st.markdown("### 🔥 持股相關性熱力圖")
-            with st.expander("📖 說明書：顏色代表什麼？"):
-                st.markdown("""
-                - 🟥 **深紅色 (接近 1.0)**：**危險！** 代表這兩支股票漲跌完全同步。風險沒有分散。
-                - 🟦 **藍色/淺色 (接近 0)**：**很好！** 代表它們走勢無關，能有效互補避險。
-                """)
-            if len(my_stocks) > 1:
-                if st.button("📊 生成熱力圖", use_container_width=True):
-                    with st.spinner("下載歷史股價並計算相關係數..."):
-                        fig = draw_correlation_heatmap(my_stocks)
-                        if fig: st.plotly_chart(fig, use_container_width=True)
-                        else: st.error("無法生成圖表")
-            else: st.warning("持股數量不足 2 支，無法計算相關性。")
-        else: st.warning("🔒 需要 Admin 權限 (涉及持倉資料)")
+        st.markdown("### 🔥 持股相關性熱力圖")
+        with st.expander("📖 說明書：顏色代表什麼？"):
+            st.markdown("""
+            - 🟥 **深紅色 (接近 1.0)**：**危險！** 代表這兩支股票漲跌完全同步。風險沒有分散。
+            - 🟦 **藍色/淺色 (接近 0)**：**很好！** 代表它們走勢無關，能有效互補避險。
+            """)
+        if len(my_stocks) > 1:
+            if st.button("📊 生成熱力圖", use_container_width=True):
+                with st.spinner("下載歷史股價並計算相關係數..."):
+                    fig = draw_correlation_heatmap(my_stocks)
+                    if fig: st.plotly_chart(fig, use_container_width=True)
+                    else: st.error("無法生成圖表")
+        else: st.warning("持股數量不足 2 支，無法計算相關性。")
 
     # --- Tab 6: 事件雷達 ---
     with tab6:
@@ -813,20 +802,27 @@ elif (page == "📝 交易紀錄" or page == "⚙️ 設定") and st.session_sta
     elif page == "⚙️ 設定":
         st.subheader("設定")
         
-        # ★★★ V31.0 重點功能：訪客模式開關 ★★★
+        # ★★★ V31.1 重點功能：自動生成魔法連結 ★★★
+        st.divider()
+        st.markdown("### 🔐 免密碼快速通關 (Magic Link)")
+        st.caption("把這個網址加入書籤，以後點它就會直接登入，不用輸入密碼！")
+        
+        # 取得當前基礎網址 (這需要部署後才準確，本地端先用 localhost)
+        # 這裡我們做一個通用的生成邏輯
+        base_url = "https://您的App網址.streamlit.app" # 提示用戶替換
+        magic_link = f"{base_url}/?auth={ADMIN_PASSWORD}"
+        
+        st.code(magic_link, language="text")
+        st.info(f"💡 請將上方的網址加入瀏覽器書籤。其中 `?auth={ADMIN_PASSWORD}` 就是您的數位鑰匙。")
+
         st.divider()
         st.markdown("### 🎛️ 系統權限中控台")
         
-        # 讀取目前設定
         current_guest_status = APP_CONFIG.get("guest_mode", False)
-        
-        # 顯示開關 (Toggle)
         new_guest_status = st.toggle("✅ 啟用訪客模式 (Guest Mode)", value=current_guest_status)
         
-        # 如果狀態改變，就存檔
         if new_guest_status != current_guest_status:
             if save_config(new_guest_status):
-                # 更新 Session 中的設定，這樣不用重整頁面就能生效
                 APP_CONFIG["guest_mode"] = new_guest_status
                 if new_guest_status:
                     st.success("🎉 訪客模式已開啟！現在朋友可以用 'guest' 密碼登入了。")
@@ -835,7 +831,7 @@ elif (page == "📝 交易紀錄" or page == "⚙️ 設定") and st.session_sta
                 st.rerun()
                 
         if current_guest_status:
-            st.info(f"訪客連結：`https://您的網址/` (密碼: {GUEST_PASSWORD})")
+            st.info(f"訪客連結：`{base_url}/` (密碼: {GUEST_PASSWORD})")
         else:
             st.caption("目前僅允許管理員登入。")
             
