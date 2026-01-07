@@ -264,40 +264,28 @@ def scan_technical_signals(df_inventory):
             ma20 = df['MA20'].iloc[-1]
             status = "盤整"
             note = ""
-            if current_rsi < 30: 
-                status = "超賣(Buy)"
-                note = f"RSI={current_rsi:.1f} 低檔鈍化"
-            elif current_rsi > 70: 
-                status = "超買(Sell)"
-                note = f"RSI={current_rsi:.1f} 過熱警戒"
+            if current_rsi < 30: status = "超賣(Buy)"; note = f"RSI={current_rsi:.1f} 低檔"
+            elif current_rsi > 70: status = "超買(Sell)"; note = f"RSI={current_rsi:.1f} 過熱"
             dist_ma = (current_price - ma20) / ma20 * 100
-            if dist_ma > 15: note += f", 乖離率過大({dist_ma:.1f}%)"
-            if dist_ma < -10: note += f", 跌深乖離({dist_ma:.1f}%)"
+            if dist_ma > 15: note += f", 乖離率過大"
+            if dist_ma < -10: note += f", 跌深乖離"
             if status != "盤整" or abs(dist_ma) > 10:
                 signals.append(f"{sym}: 現價{current_price:.1f}, {status}, {note}")
         except: pass
     return signals
 
-# ★★★ 修正後的 generate_briefing (接收正確的總市值與獲利) ★★★
 def generate_briefing(df_inventory, total_mkt_val, total_profit):
     tech_signals = scan_technical_signals(df_inventory)
     signals_text = "\n".join(tech_signals) if tech_signals else "目前無明顯極端訊號"
     summary = df_inventory[['代碼', '市值', '帳面損益']].to_dict('records')
     prompt = f"""
     你是 AI 投資總監。今天是 {date.today()}。
-    
     【市場與持倉數據】：
-    - **用戶總資產市值**：US$ {total_mkt_val:,.0f} (這是目前的股票總值)
+    - **用戶總資產市值**：US$ {total_mkt_val:,.0f}
     - **整體淨獲利**：US$ {total_profit:,.0f}
     - 持倉狀態：{summary}
     - **技術面掃描訊號**：{signals_text}
-    
-    請撰寫【晨間戰報】：
-    1. **持倉健檢**：簡單點評目前的持倉風險(請引用正確的總資產數據)。
-    2. **🎯 今日焦點買入**：根據技術訊號或市場趨勢，推薦 1-2 檔「買進/加碼」標的。
-    3. **⚠️ 今日風險警示**：推薦 1-2 檔「賣出/減碼」標的。
-    
-    請用 Markdown 格式，加上 Emoji。
+    請撰寫【晨間戰報】：1. 持倉健檢 2. 🎯 今日焦點買入 3. ⚠️ 今日風險警示。Markdown格式。
     """
     try:
         key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
@@ -309,6 +297,90 @@ def generate_briefing(df_inventory, total_mkt_val, total_profit):
             ans = genai.GenerativeModel('gemini-2.5-flash').generate_content(prompt).text
         return ans
     except Exception as e: return f"AI 發生錯誤: {str(e)}"
+
+# --- ★★★ V27.0 策略回測核心 ★★★ ---
+def run_backtest(symbol, strategy):
+    try:
+        stock = yf.Ticker(symbol)
+        df = stock.history(period="1y") # 回測一年
+        if len(df) < 50: return None, "資料不足"
+        
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA50'] = df['Close'].rolling(window=50).mean()
+        df['MA200'] = df['Close'].rolling(window=200).mean()
+        df['RSI'] = calculate_rsi(df)
+        
+        initial_capital = 10000
+        cash = initial_capital
+        position = 0
+        trades = []
+        
+        # 簡易回測迴圈
+        for i in range(200, len(df)):
+            price = df['Close'].iloc[i]
+            date_idx = df.index[i]
+            
+            signal = 0 # 0:hold, 1:buy, -1:sell
+            reason = ""
+            
+            if strategy == "黃金交叉 (MA50 > MA200)":
+                if df['MA50'].iloc[i] > df['MA200'].iloc[i] and df['MA50'].iloc[i-1] <= df['MA200'].iloc[i-1]:
+                    signal = 1; reason = "黃金交叉"
+                elif df['MA50'].iloc[i] < df['MA200'].iloc[i] and df['MA50'].iloc[i-1] >= df['MA200'].iloc[i-1]:
+                    signal = -1; reason = "死亡交叉"
+                    
+            elif strategy == "RSI 極限反轉 (30/70)":
+                if df['RSI'].iloc[i] < 30: signal = 1; reason = "RSI 超賣"
+                elif df['RSI'].iloc[i] > 70: signal = -1; reason = "RSI 超買"
+            
+            # 執行交易 (全倉買賣)
+            if signal == 1 and cash > 0:
+                position = cash / price
+                cash = 0
+                trades.append({'Date': date_idx, 'Type': 'Buy', 'Price': price, 'Reason': reason})
+            elif signal == -1 and position > 0:
+                cash = position * price
+                position = 0
+                trades.append({'Date': date_idx, 'Type': 'Sell', 'Price': price, 'Reason': reason})
+                
+        # 結算
+        final_value = cash + (position * df['Close'].iloc[-1])
+        roi = (final_value - initial_capital) / initial_capital * 100
+        buy_hold_roi = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
+        
+        return {
+            'roi': roi, 
+            'buy_hold_roi': buy_hold_roi, 
+            'trades': trades, 
+            'win': roi > 0,
+            'better_than_hold': roi > buy_hold_roi,
+            'df': df # 回傳 DF 供畫圖
+        }, "Success"
+        
+    except Exception as e: return None, str(e)
+
+# 繪製回測圖表
+def draw_backtest_chart(symbol, res):
+    df = res['df']
+    trades = res['trades']
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name='股價'))
+    
+    # 標示買賣點
+    buy_x, buy_y = [], []
+    sell_x, sell_y = [], []
+    for t in trades:
+        if t['Type'] == 'Buy':
+            buy_x.append(t['Date']); buy_y.append(t['Price'])
+        else:
+            sell_x.append(t['Date']); sell_y.append(t['Price'])
+            
+    fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode='markers', marker_symbol='triangle-up', marker_color='green', marker_size=12, name='買進'))
+    fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode='markers', marker_symbol='triangle-down', marker_color='red', marker_size=12, name='賣出'))
+    
+    fig.update_layout(title=f"{symbol} 策略回測圖", height=400)
+    return fig
 
 def draw_k_line(symbol):
     try:
@@ -371,17 +443,13 @@ with st.sidebar:
     st.divider()
     ai_model = st.selectbox("AI 模型", ["Gemini", "OpenAI"])
     
-    # --- 🤖 隨身 AI 顧問 ---
     st.divider()
     with st.expander("💬 AI 隨身顧問", expanded=True):
         st.caption("AI 已連線至您的資產資料庫")
-        
-        # 1. 準備全域背景資料 (每次刷新都會抓最新)
         if CONNECTION_STATUS:
             df_trans = load_data()
             if not df_trans.empty:
                 df_inv, realized_pl, total_dividends = calculate_portfolio(df_trans)
-                # 簡單補上市價 (為了速度，這裡不抓即時匯率，僅供參考)
                 ai_portfolio_view = df_inv[['代碼', '持股', '均價', '總成本']].to_string(index=False)
                 system_context = f"""
                 你是隨身 AI 投資顧問。
@@ -392,10 +460,8 @@ with st.sidebar:
                 {ai_portfolio_view}
                 請簡短回答。
                 """
-            else:
-                system_context = "用戶目前無持倉。"
-        else:
-            system_context = "無法連線資料庫。"
+            else: system_context = "用戶目前無持倉。"
+        else: system_context = "無法連線資料庫。"
 
         for msg in st.session_state.messages:
             role_icon = "👤" if msg["role"] == "user" else "🤖"
@@ -405,24 +471,18 @@ with st.sidebar:
             st.session_state.messages.append({"role": "user", "content": prompt})
             st.rerun()
 
-# --- 處理 AI 回覆 ---
 if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
     try:
         key = st.session_state.gemini_key if "Gemini" in ai_model else st.session_state.openai_key
-        if not key:
-            ans = "⚠️ 請先設定 API Key"
+        if not key: ans = "⚠️ 請先設定 API Key"
         elif "OpenAI" in ai_model:
-            messages = [{"role": "system", "content": system_context}] + [
-                {"role": m["role"], "content": m["content"]} for m in st.session_state.messages
-            ]
+            messages = [{"role": "system", "content": system_context}] + [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
             ans = OpenAI(api_key=key).chat.completions.create(model="gpt-4o", messages=messages).choices[0].message.content
         else:
             genai.configure(api_key=key)
             full_prompt = system_context + "\n\n用戶歷史對話:\n" + "\n".join([m['content'] for m in st.session_state.messages])
             ans = genai.GenerativeModel('gemini-2.5-flash').generate_content(full_prompt).text
-    except Exception as e:
-        ans = f"錯誤: {str(e)}"
-    
+    except Exception as e: ans = f"錯誤: {str(e)}"
     st.session_state.messages.append({"role": "assistant", "content": ans})
     st.rerun()
 
@@ -440,8 +500,6 @@ if page == "🏠 資產總覽":
                     temp_df = load_data()
                     if not temp_df.empty:
                         t_inv, t_pl, t_div = calculate_portfolio(temp_df)
-                        
-                        # ★★★ 修正點：在呼叫 AI 前，先算出正確的總市值 ★★★
                         current_total_mkt = 0
                         for i, r in t_inv.iterrows():
                             p = get_usd_price(r['代碼'])
@@ -450,12 +508,8 @@ if page == "🏠 資產總覽":
                             t_inv.at[i, '市值'] = mkt
                             t_inv.at[i, '帳面損益'] = (mkt / r['持股'] - r['均價']) * r['持股'] if r['持股'] > 0 else 0
                             current_total_mkt += mkt
-                        
-                        # 算出總獲利 (已實現+帳面+股息)
                         total_profit_val = t_pl + t_inv['帳面損益'].sum() + t_div
-                        
                         with st.spinner("AI 正在計算技術指標..."):
-                            # 傳入正確參數
                             briefing = generate_briefing(t_inv, current_total_mkt, total_profit_val)
                             st.session_state.daily_briefing = briefing
                             st.rerun()
@@ -539,15 +593,50 @@ if page == "🏠 資產總覽":
             else: st.info("無庫存。")
 
 # ==========================================
-# 頁面 2: 🛠️ 投資工具箱
+# 頁面 2: 🛠️ 投資工具箱 (新增策略回測)
 # ==========================================
 elif page == "🛠️ 投資工具箱":
     st.subheader("🛠️ 投資工具箱")
-    tab1, tab2, tab3 = st.tabs(["🔎 個股診斷", "🏹 選股獵人", "🧬 組合健檢"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 策略回測", "🔎 個股診斷", "🏹 選股獵人", "🧬 組合健檢"])
     
+    df_trans = load_data()
+    my_stocks = df_trans['Symbol'].unique().tolist() if not df_trans.empty else []
+    
+    # --- 新增：策略回測實驗室 ---
     with tab1:
-        df_trans = load_data()
-        my_stocks = df_trans['Symbol'].unique().tolist() if not df_trans.empty else []
+        st.markdown("### 🤖 AI 策略回測實驗室")
+        st.caption("驗證策略在過去一年的表現，別再憑感覺下單。")
+        
+        c1, c2 = st.columns([1,1])
+        with c1: 
+            sel_s = st.selectbox("回測標的", [""] + my_stocks + ["NVDA", "TSLA", "AAPL", "AMD", "SPY"])
+            inp_s = st.text_input("或輸入代號 (如 2330.TW)", value=sel_s)
+        with c2:
+            strategy = st.selectbox("選擇策略", ["黃金交叉 (MA50 > MA200)", "RSI 極限反轉 (30/70)"])
+            
+        target = inp_s.upper().strip()
+        
+        if st.button("🚀 開始回測", type="primary", use_container_width=True):
+            if not target: st.error("請輸入股票代號")
+            else:
+                with st.spinner(f"正在模擬 {strategy} 交易..."):
+                    res, msg = run_backtest(target, strategy)
+                    if res:
+                        st.success(f"回測完成！ 策略報酬率: {res['roi']:.2f}%")
+                        
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("策略報酬", f"{res['roi']:.1f}%", delta_color="normal" if res['roi']>0 else "inverse")
+                        m2.metric("買進持有 (Benchmark)", f"{res['buy_hold_roi']:.1f}%")
+                        m3.metric("勝過大盤?", "✅ 是" if res['better_than_hold'] else "❌ 否")
+                        
+                        st.plotly_chart(draw_backtest_chart(target, res), use_container_width=True)
+                        
+                        with st.expander("查看交易明細"):
+                            st.table(pd.DataFrame(res['trades']))
+                    else:
+                        st.error(f"回測失敗: {msg}")
+
+    with tab2:
         col_sel, col_in = st.columns([1,1])
         with col_sel: sel_stock = st.selectbox("選擇持股", [""] + my_stocks)
         with col_in: inp_stock = st.text_input("或輸入代號", value=sel_stock)
@@ -583,13 +672,9 @@ elif page == "🛠️ 投資工具箱":
             st.info(st.session_state.tool_results["stock_diagnosis"])
             render_followup_chat("diag_chat", st.session_state.tool_results["stock_diagnosis"])
 
-    with tab2:
+    with tab3:
         st.write("🤖 AI 自動掃描市場機會")
-        strategy = st.selectbox("選擇策略", ["價值抄底 (RSI < 30)", "強勢突破 (站上月線)", "高股息定存"])
-        if strategy == "價值抄底 (RSI < 30)": st.info("跌深反彈，分批低接。")
-        elif strategy == "強勢突破 (站上月線)": st.info("站上月線，順勢買進。")
-        elif strategy == "高股息定存": st.info("穩定配息，定期定額。")
-
+        strategy = st.selectbox("掃描策略", ["價值抄底 (RSI < 30)", "強勢突破 (站上月線)", "高股息定存"])
         if st.button("🔍 開始掃描", type="primary", use_container_width=True):
             st.caption("模擬掃描...")
             prompt = f"請從美股七巨頭和台積電中，根據「{strategy}」策略，推薦 1 支最值得買的股票並說明原因。"
@@ -607,7 +692,7 @@ elif page == "🛠️ 投資工具箱":
             st.success(st.session_state.tool_results["stock_hunter"])
             render_followup_chat("hunter_chat", st.session_state.tool_results["stock_hunter"])
 
-    with tab3:
+    with tab4:
         df_inv, _, _ = calculate_portfolio(load_data())
         if not df_inv.empty:
             for i, r in df_inv.iterrows(): df_inv.at[i, '市值'] = get_usd_price(r['代碼']) * r['持股']
