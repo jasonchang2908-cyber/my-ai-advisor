@@ -21,11 +21,9 @@ if "gemini_key" not in st.session_state: st.session_state.gemini_key = st.secret
 if "tool_results" not in st.session_state:
     st.session_state.tool_results = {"stock_diagnosis": None, "stock_hunter": None, "portfolio_check": None}
 if "daily_briefing" not in st.session_state: st.session_state.daily_briefing = None
-if "user_role" not in st.session_state: st.session_state.user_role = None 
 
-# --- 設定密碼 ---
-ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin123") 
-GUEST_PASSWORD = "guest"     
+# ★★★ V34.0 修改：預設直接給予 Admin 權限，免登入 ★★★
+if "user_role" not in st.session_state: st.session_state.user_role = "Admin" 
 
 # --- 3. 核心邏輯 (Google Sheets) ---
 try:
@@ -40,28 +38,7 @@ except ImportError:
     st.error("⚠️ 嚴重錯誤：缺少套件。請在終端機執行 `pip install st-gsheets-connection`")
     st.stop()
 
-# --- Config Management ---
-def load_config():
-    if not CONNECTION_STATUS: return {"guest_mode": False}
-    try:
-        df_config = conn.read(worksheet="config", ttl=0)
-        if not df_config.empty and "guest_mode" in df_config.columns:
-            return {"guest_mode": bool(df_config.iloc[0]["guest_mode"])}
-    except: pass
-    return {"guest_mode": False} 
-
-def save_config(guest_mode_status):
-    if not CONNECTION_STATUS: return False
-    try:
-        df = pd.DataFrame([{"guest_mode": guest_mode_status}])
-        conn.update(worksheet="config", data=df)
-        return True
-    except: return False
-
-APP_CONFIG = load_config()
-
 def load_data():
-    if st.session_state.user_role != "Admin": return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
     if not CONNECTION_STATUS: return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
     try:
         df = conn.read(ttl=0) 
@@ -78,7 +55,6 @@ def load_data():
     except: return pd.DataFrame(columns=["Date", "Account", "Action", "Symbol", "Price", "Shares"])
 
 def save_data_to_gsheet(df):
-    if st.session_state.user_role != "Admin": return False 
     if not CONNECTION_STATUS: return False
     try:
         df_save = df.copy()
@@ -88,7 +64,6 @@ def save_data_to_gsheet(df):
     except: return False
 
 def load_local_csv():
-    if st.session_state.user_role != "Admin": return None
     local_file = 'my_portfolio.csv'
     if os.path.exists(local_file):
         try:
@@ -180,12 +155,23 @@ def get_usdcad_rate():
 def get_stock_news(symbol):
     news_items = []
     try:
-        url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            root = ET.fromstring(response.content)
-            for item in root.findall('./channel/item')[:5]:
-                news_items.append({'title': item.find('title').text, 'link': item.find('link').text, 'date': item.find('pubDate').text})
+        stock = yf.Ticker(symbol)
+        news = stock.news
+        if news:
+            for n in news[:3]:
+                news_items.append({
+                    'title': n.get('title'),
+                    'link': n.get('link'),
+                    'publisher': n.get('publisher'),
+                    'time': datetime.fromtimestamp(n.get('providerPublishTime', 0)).strftime('%Y-%m-%d')
+                })
+        else:
+            url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                root = ET.fromstring(response.content)
+                for item in root.findall('./channel/item')[:3]:
+                    news_items.append({'title': item.find('title').text, 'link': item.find('link').text, 'time': item.find('pubDate').text})
     except: pass
     return news_items
 
@@ -425,64 +411,17 @@ def draw_radar(symbol):
     except: return None
 
 # ==========================================
-# 側邊欄：登入 & 導航
+# 側邊欄：導航 & 全知全能 AI
 # ==========================================
 with st.sidebar:
     st.header("📱 指揮中心")
-    query_params = st.query_params
-    auth_token = query_params.get("auth", "")
-    
-    is_guest_mode_active = APP_CONFIG.get("guest_mode", False)
-    
-    # --- 登入邏輯 ---
-    if st.session_state.user_role is None:
-        if auth_token == ADMIN_PASSWORD:
-            st.session_state.user_role = "Admin"
-            st.toast(f"🔑 魔法連結驗證成功！", icon="🚀")
-            st.rerun()
-            
-        st.info("🔒 請登入")
-        pwd = st.text_input("輸入密碼", type="password")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("登入", use_container_width=True):
-                if pwd == ADMIN_PASSWORD:
-                    st.session_state.user_role = "Admin"
-                    st.rerun()
-                elif is_guest_mode_active and pwd == GUEST_PASSWORD:
-                    st.session_state.user_role = "Guest"
-                    st.success("訪客模式")
-                    st.rerun()
-                else:
-                    if not is_guest_mode_active and pwd == GUEST_PASSWORD:
-                        st.error("訪客功能目前已關閉")
-                    else:
-                        st.error("密碼錯誤")
-        
-        if not is_guest_mode_active:
-            st.caption("🚫 訪客模式：已停用")
-        else:
-            st.caption("✅ 訪客模式：開放中")
-            
-        st.stop() 
-
-    # --- 登入後選單 ---
-    if st.session_state.user_role == "Admin":
-        st.write("👤 身份: **Admin**")
-        if st.button("登出"): st.session_state.user_role = None; st.rerun()
-        page = st.radio("前往", ["🏠 資產總覽", "🛠️ 投資工具箱", "📝 交易紀錄", "⚙️ 設定"])
-    else:
-        st.write("👤 身份: **Guest**")
-        if st.button("登出"): st.session_state.user_role = None; st.rerun()
-        page = st.radio("前往", ["🛠️ 投資工具箱"])
-
+    page = st.radio("前往", ["🏠 資產總覽", "🛠️ 投資工具箱", "📝 交易紀錄", "⚙️ 設定"])
     st.divider()
     ai_model = st.selectbox("AI 模型", ["Gemini", "OpenAI"])
     
     st.divider()
     with st.expander("💬 AI 隨身顧問", expanded=True):
-        if st.session_state.user_role == "Admin" and CONNECTION_STATUS:
+        if CONNECTION_STATUS:
             st.caption("AI 已連線至您的資產資料庫")
             df_trans = load_data()
             if not df_trans.empty:
@@ -491,7 +430,7 @@ with st.sidebar:
                 system_context = f"你是隨身AI投資顧問。用戶數據：損益{realized_pl}，股息{total_dividends}。持倉：\n{ai_portfolio_view}"
             else: system_context = "用戶無持倉。"
         else:
-            st.caption("AI 處於通用模式")
+            st.caption("無法連線資料庫")
             system_context = "你是專業的 AI 投資顧問。"
 
         for msg in st.session_state.messages:
@@ -522,7 +461,6 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
 # ==========================================
 if page == "🏠 資產總覽":
     st.subheader("💰 資產戰情室 (USD)")
-    # (同 V29.1)
     if not CONNECTION_STATUS: st.error("⚠️ 無法連線至 Google Sheets")
     else:
         with st.container(border=True):
@@ -641,12 +579,10 @@ elif page == "🛠️ 投資工具箱":
         "🔥 相關性", "💣 事件雷達", "🧬 組合健檢"
     ])
     
-    if st.session_state.user_role == "Admin":
-        df_trans = load_data()
-        my_stocks = df_trans['Symbol'].unique().tolist() if not df_trans.empty else []
-    else: my_stocks = []
+    df_trans = load_data()
+    my_stocks = df_trans['Symbol'].unique().tolist() if not df_trans.empty else []
 
-    # --- Tab 1: 策略回測 ---
+    # --- Tab 1: 策略回測 (Smart Selector) ---
     with tab1:
         st.markdown("### 🤖 策略回測實驗室")
         with st.expander("📖 說明書：如何看回測訊號？", expanded=True):
@@ -675,7 +611,7 @@ elif page == "🛠️ 投資工具箱":
                         st.plotly_chart(draw_backtest_chart(target, res), use_container_width=True)
                     else: st.error(f"回測失敗: {msg}")
 
-    # --- Tab 2: 合理價試算 ---
+    # --- Tab 2: 合理價試算 (Smart Selector) ---
     with tab2:
         st.markdown("### ⚖️ 價值投資計算器 (Graham/Lynch)")
         with st.expander("📖 說明書：股價多少算便宜？"):
@@ -685,7 +621,12 @@ elif page == "🛠️ 投資工具箱":
                 - **PEG < 1**：✅ 便宜 (成長速度 > 本益比)。
                 - **PEG > 1.5**：⚠️ 昂貴 (股價可能透支了未來的成長)。
             """)
-        val_target = st.text_input("輸入代號 (如 AAPL)", key="val_input").upper().strip()
+        
+        # Smart Selector
+        col_v1, col_v2 = st.columns([1,1])
+        with col_v1: v_sel = st.selectbox("選擇持股", [""] + my_stocks, key="fv_sel")
+        with col_v2: val_target = st.text_input("或輸入代號", value=v_sel, key="fv_inp").upper().strip()
+        
         if st.button("💰 計算合理價", type="primary"):
             if not val_target: st.error("請輸入代號")
             else:
@@ -706,11 +647,16 @@ elif page == "🛠️ 投資工具箱":
                         else: c3.info("無成長率數據")
                     else: st.error("無法取得財報數據")
 
-    # --- Tab 3: 個股診斷 ---
+    # --- Tab 3: 個股診斷 (Smart Selector) ---
     with tab3:
         with st.expander("📖 說明書：怎麼看五力雷達圖？"):
             st.caption("圖形面積越大越好。\n- **獲利**：公司賺錢能力。\n- **成長**：營收是否在增加。\n- **估值**：越靠外圈代表越便宜。\n- **股息**：殖利率高低。\n- **ROE**：股東權益報酬率。")
-        target = st.text_input("輸入代號診斷", key="diag_input_simple").upper().strip()
+        
+        # Smart Selector
+        col_d1, col_d2 = st.columns([1,1])
+        with col_d1: d_sel = st.selectbox("選擇持股", [""] + my_stocks, key="diag_sel")
+        with col_d2: target = st.text_input("或輸入代號", value=d_sel, key="diag_inp").upper().strip()
+        
         if st.button("🚀 診斷", key="diag_btn_simple"):
             with st.spinner("分析中..."):
                 st.plotly_chart(draw_k_line(target), use_container_width=True)
@@ -739,113 +685,133 @@ elif page == "🛠️ 投資工具箱":
                     else: st.error("無法生成圖表")
         else: st.warning("持股數量不足 2 支，無法計算相關性。")
 
-    # --- Tab 6: 事件雷達 ---
+    # --- Tab 6: 事件雷達 (Smart Selector) ---
     with tab6:
         st.markdown("### 💣 財報與除息雷達")
         with st.expander("📖 說明書：為什麼要避開財報日？"):
             st.caption("美股財報公佈當天，股價常會有劇烈波動 (±10% 以上)。保守投資人建議避開。")
-        radar_input = st.text_input("輸入代號查詢近期事件", value=my_stocks[0] if my_stocks else "").upper().strip()
-        if st.button("📡 掃描事件"):
-            try:
-                stock = yf.Ticker(radar_input)
-                cal = stock.calendar
-                if cal and not cal.empty:
-                    st.write(f"**{radar_input} 近期事件：**")
-                    st.dataframe(cal)
-                else: st.info("近期無已公告之財報或除息事件。")
-            except: st.error("查無資料")
+        
+        # 1. 掃描全持股按鈕
+        if my_stocks:
+            if st.button("📡 掃描所有持股事件", type="primary", use_container_width=True):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for i, symbol in enumerate(my_stocks):
+                    progress = (i + 1) / len(my_stocks)
+                    progress_bar.progress(progress)
+                    status_text.caption(f"正在掃描 {symbol}...")
+                    
+                    with st.expander(f"{symbol} 事件與新聞", expanded=False):
+                        try:
+                            stock = yf.Ticker(symbol)
+                            
+                            # 1. 抓行事曆 (未來事件)
+                            cal = stock.calendar
+                            has_calendar = False
+                            if cal and isinstance(cal, dict) and 'Earnings Date' in cal:
+                                st.success(f"📅 **近期財報日**: {cal['Earnings Date'][0]}")
+                                has_calendar = True
+                            elif cal and not isinstance(cal, dict) and not cal.empty:
+                                st.dataframe(cal)
+                                has_calendar = True
+                            
+                            if not has_calendar:
+                                st.info("暫無表定之財報或除息事件。")
+
+                            # 2. 抓新聞 (無論有無事件都顯示)
+                            st.markdown("**📰 最新動態：**")
+                            news_items = get_stock_news(symbol)
+                            if news_items:
+                                for n in news_items:
+                                    st.write(f"- [{n['title']}]({n['link']}) ({n['time']})")
+                            else:
+                                st.caption("無相關新聞。")
+                                
+                        except Exception as e:
+                            st.error(f"讀取錯誤: {str(e)}")
+                            
+                status_text.success("✅ 掃描完成！")
+                progress_bar.empty()
+        
+        # 2. 單一查詢 (Smart Selector)
+        st.divider()
+        st.caption("或查詢特定代號：")
+        
+        # Smart Selector
+        col_r1, col_r2 = st.columns([1,1])
+        with col_r1: r_sel = st.selectbox("選擇持股", [""] + my_stocks, key="radar_sel")
+        with col_r2: radar_input = st.text_input("或輸入代號", value=r_sel, key="radar_inp").upper().strip()
+        
+        if st.button("🔍 查詢個股"):
+            if not radar_input: st.error("請輸入代號")
+            else:
+                try:
+                    stock = yf.Ticker(radar_input)
+                    cal = stock.calendar
+                    st.write(f"**{radar_input} 資料：**")
+                    if cal and isinstance(cal, dict) and 'Earnings Date' in cal:
+                         st.success(f"📅 **近期財報日**: {cal['Earnings Date'][0]}")
+                    elif cal and not isinstance(cal, dict) and not cal.empty:
+                        st.dataframe(cal)
+                    else: st.info("無近期表定事件。")
+                    
+                    st.markdown("**📰 最新新聞：**")
+                    news = get_stock_news(radar_input)
+                    for n in news: st.write(f"- [{n['title']}]({n['link']})")
+                except: st.error("查無資料")
 
     # --- Tab 7: 組合健檢 ---
     with tab7:
-        if st.session_state.user_role == "Admin":
-            df_inv, _, _ = calculate_portfolio(load_data())
-            if not df_inv.empty:
-                # --- FIX: 先計算市值，避免 px.pie 崩潰 ---
-                with st.spinner("正在更新最新市值以繪製圖表..."):
-                    for i, row in df_inv.iterrows():
-                        p = get_usd_price(row['代碼'])
-                        df_inv.at[i, '市值'] = p * row['持股']
-                st.write("📊 帳戶配置")
-                st.plotly_chart(px.pie(df_inv, values='市值', names='帳戶', hole=0.4), use_container_width=True)
-            else: st.warning("無庫存")
-        else: st.warning("🔒 需要 Admin 權限")
+        df_inv, _, _ = calculate_portfolio(load_data())
+        if not df_inv.empty:
+            with st.spinner("正在更新最新市值以繪製圖表..."):
+                for i, row in df_inv.iterrows():
+                    p = get_usd_price(row['代碼'])
+                    df_inv.at[i, '市值'] = p * row['持股']
+            st.write("📊 帳戶配置")
+            st.plotly_chart(px.pie(df_inv, values='市值', names='帳戶', hole=0.4), use_container_width=True)
+        else: st.warning("無庫存")
 
 # ==========================================
 # 頁面 3, 4: Admin Only
 # ==========================================
-elif (page == "📝 交易紀錄" or page == "⚙️ 設定") and st.session_state.user_role == "Admin":
-    if page == "📝 交易紀錄":
-        st.subheader("📝 交易流水帳")
-        with st.expander("📖 說明書：各種情境怎麼記？"):
-            st.markdown("""
-            - **領股息出來花**：Action 選 `Dividend`，輸入領到的總金額。
-            - **股息再投入 (DRIP)**：記兩筆。
-                1. `Dividend` (紀錄收入)
-                2. `Buy` (紀錄買進新股數)
-            - **賣股票提款**：Action 選 `Sell`，輸入當時的賣出價格 (Price) 與股數。
-            """)
-        if CONNECTION_STATUS:
-            df_trans = load_data()
-            with st.expander("🔎 自動掃描漏記股息"):
-                if st.button("開始掃描"):
-                    with st.spinner("查詢中..."):
-                        missing = scan_missing_dividends(df_trans)
-                        st.session_state['missing_divs'] = missing
-                if 'missing_divs' in st.session_state and st.session_state['missing_divs']:
-                    st.success(f"發現 {len(st.session_state['missing_divs'])} 筆漏記！")
-                    st.dataframe(pd.DataFrame(st.session_state['missing_divs']))
-                    if st.button("💾 加入帳本"):
-                        new_rec = pd.DataFrame(st.session_state['missing_divs']).drop(columns=['Info'])
-                        save_data_to_gsheet(pd.concat([df_trans, new_rec], ignore_index=True))
-                        st.success("成功！"); del st.session_state['missing_divs']; st.rerun()
-            
-            edited_df = st.data_editor(df_trans, num_rows="dynamic", use_container_width=True, hide_index=True)
-            if st.button("💾 儲存變更"):
-                save_data_to_gsheet(edited_df)
-                st.success("已儲存！"); st.rerun()
+elif page == "📝 交易紀錄":
+    st.subheader("📝 交易流水帳")
+    with st.expander("📖 說明書：各種情境怎麼記？"):
+        st.markdown("""
+        - **領股息出來花**：Action 選 `Dividend`，輸入領到的總金額。
+        - **股息再投入 (DRIP)**：記兩筆。
+            1. `Dividend` (紀錄收入)
+            2. `Buy` (紀錄買進新股數)
+        - **賣股票提款**：Action 選 `Sell`，輸入當時的賣出價格 (Price) 與股數。
+        """)
+    if CONNECTION_STATUS:
+        df_trans = load_data()
+        with st.expander("🔎 自動掃描漏記股息"):
+            if st.button("開始掃描"):
+                with st.spinner("查詢中..."):
+                    missing = scan_missing_dividends(df_trans)
+                    st.session_state['missing_divs'] = missing
+            if 'missing_divs' in st.session_state and st.session_state['missing_divs']:
+                st.success(f"發現 {len(st.session_state['missing_divs'])} 筆漏記！")
+                st.dataframe(pd.DataFrame(st.session_state['missing_divs']))
+                if st.button("💾 加入帳本"):
+                    new_rec = pd.DataFrame(st.session_state['missing_divs']).drop(columns=['Info'])
+                    save_data_to_gsheet(pd.concat([df_trans, new_rec], ignore_index=True))
+                    st.success("成功！"); del st.session_state['missing_divs']; st.rerun()
+        
+        edited_df = st.data_editor(df_trans, num_rows="dynamic", use_container_width=True, hide_index=True)
+        if st.button("💾 儲存變更"):
+            save_data_to_gsheet(edited_df)
+            st.success("已儲存！"); st.rerun()
 
-    elif page == "⚙️ 設定":
-        st.subheader("設定")
-        
-        # ★★★ V31.1 重點功能：自動生成魔法連結 ★★★
-        st.divider()
-        st.markdown("### 🔐 免密碼快速通關 (Magic Link)")
-        st.caption("把這個網址加入書籤，以後點它就會直接登入，不用輸入密碼！")
-        
-        # 取得當前基礎網址 (這需要部署後才準確，本地端先用 localhost)
-        # 這裡我們做一個通用的生成邏輯
-        base_url = "https://my-ai-advisor.streamlit.app" # 提示用戶替換
-        magic_link = f"{base_url}/?auth={ADMIN_PASSWORD}"
-        
-        st.code(magic_link, language="text")
-        st.info(f"💡 請將上方的網址加入瀏覽器書籤。其中 `?auth={ADMIN_PASSWORD}` 就是您的數位鑰匙。")
-
-        st.divider()
-        st.markdown("### 🎛️ 系統權限中控台")
-        
-        current_guest_status = APP_CONFIG.get("guest_mode", False)
-        new_guest_status = st.toggle("✅ 啟用訪客模式 (Guest Mode)", value=current_guest_status)
-        
-        if new_guest_status != current_guest_status:
-            if save_config(new_guest_status):
-                APP_CONFIG["guest_mode"] = new_guest_status
-                if new_guest_status:
-                    st.success("🎉 訪客模式已開啟！現在朋友可以用 'guest' 密碼登入了。")
-                else:
-                    st.warning("🔒 訪客模式已關閉！所有訪客將被踢出。")
-                st.rerun()
-                
-        if current_guest_status:
-            st.info(f"訪客連結：`{base_url}/` (密碼: {GUEST_PASSWORD})")
-        else:
-            st.caption("目前僅允許管理員登入。")
-            
-        st.divider()
-        
-        with st.expander("🔑 API Key"):
-            new_o = st.text_input("OpenAI", value=st.session_state.openai_key, type="password")
-            new_g = st.text_input("Gemini", value=st.session_state.gemini_key, type="password")
-            if st.button("Update"): st.session_state.openai_key = new_o; st.session_state.gemini_key = new_g; st.success("OK")
-        local_df = load_local_csv()
-        if local_df is not None and st.button("📤 上傳舊資料"):
-            save_data_to_gsheet(local_df); st.success("Done")
+elif page == "⚙️ 設定":
+    st.subheader("設定")
+    with st.expander("🔑 API Key"):
+        new_o = st.text_input("OpenAI", value=st.session_state.openai_key, type="password")
+        new_g = st.text_input("Gemini", value=st.session_state.gemini_key, type="password")
+        if st.button("Update"): st.session_state.openai_key = new_o; st.session_state.gemini_key = new_g; st.success("OK")
+    local_df = load_local_csv()
+    if local_df is not None and st.button("📤 上傳舊資料"):
+        save_data_to_gsheet(local_df); st.success("Done")
