@@ -64,27 +64,6 @@ def save_data_to_gsheet(df):
         return True
     except: return False
 
-# ★★★ V34.3 FIX: 補回缺失的 load_local_csv 函式 ★★★
-def load_local_csv():
-    local_file = 'my_portfolio.csv'
-    if os.path.exists(local_file):
-        try:
-            df = pd.read_csv(local_file)
-            if 'BuyDate' in df.columns: df = df.rename(columns={'BuyDate': 'Date'})
-            if 'Cost' in df.columns: df = df.rename(columns={'Cost': 'Price'})
-            if 'Action' not in df.columns: df['Action'] = 'Buy'
-            required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
-            for col in required_cols:
-                if col not in df.columns:
-                    if col == "Account": df[col] = "TFSA"
-                    elif col == "Date": df[col] = str(date.today())
-                    else: df[col] = ""
-            df = df[required_cols]
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
-            return df
-        except: return None
-    return None
-
 def calculate_portfolio(df_transactions):
     if df_transactions.empty: return pd.DataFrame(), 0, 0
     holdings = {}
@@ -154,13 +133,11 @@ def get_usdcad_rate():
     try: return yf.Ticker("CAD=X").history(period="1d")['Close'].iloc[-1]
     except: return 1.35
 
-# ★★★ Google News RSS ★★★
 def get_stock_news(symbol):
     news_items = []
     try:
         url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         response = requests.get(url, timeout=5)
-        
         if response.status_code == 200:
             root = ET.fromstring(response.content)
             for item in root.findall('./channel/item')[:3]:
@@ -172,7 +149,6 @@ def get_stock_news(symbol):
                         dt = parsedate_to_datetime(pub_date_str)
                         date_str = dt.strftime('%Y-%m-%d')
                     except: date_str = "Recent"
-
                     if title and link:
                         news_items.append({'title': title, 'link': link, 'time': date_str})
                 except: continue
@@ -627,10 +603,12 @@ elif page == "🛠️ 投資工具箱":
                 - **PEG > 1.5**：⚠️ 昂貴 (股價可能透支了未來的成長)。
             """)
         
+        # ★★★ V34.2 FIX: 邏輯修正 ★★★
         col_v1, col_v2 = st.columns([1,1])
         with col_v1: v_sel = st.selectbox("選擇持股", [""] + my_stocks, key="fv_sel")
         with col_v2: val_input_text = st.text_input("或輸入代號", key="fv_inp").upper().strip()
         
+        # 決定最終要查的代號：如果有手動輸入就用手動，否則用選單
         val_target = val_input_text if val_input_text else v_sel
         
         if st.button("💰 計算合理價", type="primary"):
@@ -658,6 +636,7 @@ elif page == "🛠️ 投資工具箱":
         with st.expander("📖 說明書：怎麼看五力雷達圖？"):
             st.caption("圖形面積越大越好。\n- **獲利**：公司賺錢能力。\n- **成長**：營收是否在增加。\n- **估值**：越靠外圈代表越便宜。\n- **股息**：殖利率高低。\n- **ROE**：股東權益報酬率。")
         
+        # ★★★ V34.2 FIX ★★★
         col_d1, col_d2 = st.columns([1,1])
         with col_d1: d_sel = st.selectbox("選擇持股", [""] + my_stocks, key="diag_sel")
         with col_d2: diag_input_text = st.text_input("或輸入代號", key="diag_inp").upper().strip()
@@ -736,6 +715,7 @@ elif page == "🛠️ 投資工具箱":
         st.divider()
         st.caption("或查詢特定代號：")
         
+        # ★★★ V34.2 FIX ★★★
         col_r1, col_r2 = st.columns([1,1])
         with col_r1: r_sel = st.selectbox("選擇持股", [""] + my_stocks, key="radar_sel")
         with col_r2: radar_input_text = st.text_input("或輸入代號", key="radar_inp").upper().strip()
@@ -763,15 +743,49 @@ elif page == "🛠️ 投資工具箱":
 
     # --- Tab 7: 組合健檢 ---
     with tab7:
+        # ★★★ V35.0 NEW: 產業健檢 ★★★
         df_inv, _, _ = calculate_portfolio(load_data())
         if not df_inv.empty:
-            with st.spinner("正在更新最新市值以繪製圖表..."):
+            with st.spinner("正在分析持股產業結構..."):
+                
+                # 1. 抓取產業資料 (Sector)
+                sector_data = []
                 for i, row in df_inv.iterrows():
-                    p = get_usd_price(row['代碼'])
-                    df_inv.at[i, '市值'] = p * row['持股']
-            st.write("📊 帳戶配置")
-            st.plotly_chart(px.pie(df_inv, values='市值', names='帳戶', hole=0.4), use_container_width=True)
-        else: st.warning("無庫存")
+                    sym = row['代碼']
+                    try:
+                        # 嘗試抓取 Sector，抓不到就歸類為 "Other"
+                        info = yf.Ticker(sym).info
+                        sector = info.get('sector', 'Other')
+                    except:
+                        sector = 'Other'
+                    
+                    # 計算最新市值
+                    p = get_usd_price(sym)
+                    mkt_val = p * row['持股']
+                    
+                    sector_data.append({'Sector': sector, 'MarketValue': mkt_val, 'Symbol': sym})
+                
+                df_sector = pd.DataFrame(sector_data)
+                
+                # 2. 繪製圖表
+                col_chart1, col_chart2 = st.columns(2)
+                
+                with col_chart1:
+                    st.markdown("### 🏭 產業分散度")
+                    fig_sec = px.pie(df_sector, values='MarketValue', names='Sector', hole=0.4)
+                    st.plotly_chart(fig_sec, use_container_width=True)
+                    
+                with col_chart2:
+                    st.markdown("### 👑 個股權重 (Top Holdings)")
+                    fig_hold = px.pie(df_sector, values='MarketValue', names='Symbol', hole=0.4)
+                    st.plotly_chart(fig_hold, use_container_width=True)
+                    
+                # 3. 文字分析
+                top_sector = df_sector.groupby('Sector')['MarketValue'].sum().idxmax()
+                top_stock = df_sector.loc[df_sector['MarketValue'].idxmax()]['Symbol']
+                st.info(f"💡 **AI 觀點**：您的資金最集中在 **{top_sector}** 產業；第一大持股是 **{top_stock}**。")
+                
+        else: st.warning("無庫存，無法進行健檢。")
 
 # ==========================================
 # 頁面 3, 4: Admin Only
@@ -812,6 +826,6 @@ elif page == "⚙️ 設定":
         new_o = st.text_input("OpenAI", value=st.session_state.openai_key, type="password")
         new_g = st.text_input("Gemini", value=st.session_state.gemini_key, type="password")
         if st.button("Update"): st.session_state.openai_key = new_o; st.session_state.gemini_key = new_g; st.success("OK")
-    local_df = load_local_csv()
-    if local_df is not None and st.button("📤 上傳舊資料"):
-        save_data_to_gsheet(local_df); st.success("Done")
+    
+    # 這裡不需要再呼叫 load_local_csv，因為現在是雲端版
+    st.caption("目前使用 Google Sheets 雲端資料庫。")
