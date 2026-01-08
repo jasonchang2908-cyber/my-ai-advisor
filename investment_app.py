@@ -10,6 +10,7 @@ import plotly.express as px
 import requests 
 import xml.etree.ElementTree as ET
 import numpy as np
+from email.utils import parsedate_to_datetime
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="AI 投資指揮中心", layout="wide", initial_sidebar_state="expanded")
@@ -22,8 +23,8 @@ if "tool_results" not in st.session_state:
     st.session_state.tool_results = {"stock_diagnosis": None, "stock_hunter": None, "portfolio_check": None}
 if "daily_briefing" not in st.session_state: st.session_state.daily_briefing = None
 
-# ★★★ V34.0 修改：預設直接給予 Admin 權限，免登入 ★★★
-if "user_role" not in st.session_state: st.session_state.user_role = "Admin" 
+# ★★★ 設定為 Admin ★★★
+if "user_role" not in st.session_state: st.session_state.user_role = "Admin"
 
 # --- 3. 核心邏輯 (Google Sheets) ---
 try:
@@ -62,26 +63,6 @@ def save_data_to_gsheet(df):
         conn.update(data=df_save) 
         return True
     except: return False
-
-def load_local_csv():
-    local_file = 'my_portfolio.csv'
-    if os.path.exists(local_file):
-        try:
-            df = pd.read_csv(local_file)
-            if 'BuyDate' in df.columns: df = df.rename(columns={'BuyDate': 'Date'})
-            if 'Cost' in df.columns: df = df.rename(columns={'Cost': 'Price'})
-            if 'Action' not in df.columns: df['Action'] = 'Buy'
-            required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
-            for col in required_cols:
-                if col not in df.columns:
-                    if col == "Account": df[col] = "TFSA"
-                    elif col == "Date": df[col] = str(date.today())
-                    else: df[col] = ""
-            df = df[required_cols]
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
-            return df
-        except: return None
-    return None
 
 def calculate_portfolio(df_transactions):
     if df_transactions.empty: return pd.DataFrame(), 0, 0
@@ -152,27 +133,39 @@ def get_usdcad_rate():
     try: return yf.Ticker("CAD=X").history(period="1d")['Close'].iloc[-1]
     except: return 1.35
 
+# ★★★ V34.2 修復：改用 Google News RSS 確保資料穩定 ★★★
 def get_stock_news(symbol):
     news_items = []
     try:
-        stock = yf.Ticker(symbol)
-        news = stock.news
-        if news:
-            for n in news[:3]:
-                news_items.append({
-                    'title': n.get('title'),
-                    'link': n.get('link'),
-                    'publisher': n.get('publisher'),
-                    'time': datetime.fromtimestamp(n.get('providerPublishTime', 0)).strftime('%Y-%m-%d')
-                })
-        else:
-            url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                root = ET.fromstring(response.content)
-                for item in root.findall('./channel/item')[:3]:
-                    news_items.append({'title': item.find('title').text, 'link': item.find('link').text, 'time': item.find('pubDate').text})
-    except: pass
+        # 使用 Google News RSS (繁體中文)
+        url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        response = requests.get(url, timeout=5)
+        
+        if response.status_code == 200:
+            root = ET.fromstring(response.content)
+            # 解析 XML
+            for item in root.findall('./channel/item')[:3]:
+                try:
+                    title = item.find('title').text
+                    link = item.find('link').text
+                    pub_date_str = item.find('pubDate').text
+                    
+                    # 處理日期格式 (從 RSS 格式轉為 YYYY-MM-DD)
+                    try:
+                        dt = parsedate_to_datetime(pub_date_str)
+                        date_str = dt.strftime('%Y-%m-%d')
+                    except:
+                        date_str = "Recent"
+
+                    if title and link:
+                        news_items.append({
+                            'title': title,
+                            'link': link,
+                            'time': date_str
+                        })
+                except: continue
+    except Exception as e:
+        print(f"News Error: {e}")
     return news_items
 
 def scan_missing_dividends(df_trans):
@@ -461,6 +454,7 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
 # ==========================================
 if page == "🏠 資產總覽":
     st.subheader("💰 資產戰情室 (USD)")
+    # (同 V29.1)
     if not CONNECTION_STATUS: st.error("⚠️ 無法連線至 Google Sheets")
     else:
         with st.container(border=True):
@@ -611,7 +605,7 @@ elif page == "🛠️ 投資工具箱":
                         st.plotly_chart(draw_backtest_chart(target, res), use_container_width=True)
                     else: st.error(f"回測失敗: {msg}")
 
-    # --- Tab 2: 合理價試算 (Smart Selector) ---
+    # --- Tab 2: 合理價試算 (Smart Selector + V34.2 FIX) ---
     with tab2:
         st.markdown("### ⚖️ 價值投資計算器 (Graham/Lynch)")
         with st.expander("📖 說明書：股價多少算便宜？"):
@@ -622,15 +616,18 @@ elif page == "🛠️ 投資工具箱":
                 - **PEG > 1.5**：⚠️ 昂貴 (股價可能透支了未來的成長)。
             """)
         
-        # Smart Selector
+        # ★★★ V34.2 FIX: 邏輯修正 ★★★
         col_v1, col_v2 = st.columns([1,1])
         with col_v1: v_sel = st.selectbox("選擇持股", [""] + my_stocks, key="fv_sel")
-        with col_v2: val_target = st.text_input("或輸入代號", value=v_sel, key="fv_inp").upper().strip()
+        with col_v2: val_input_text = st.text_input("或輸入代號", key="fv_inp").upper().strip()
+        
+        # 決定最終要查的代號：如果有手動輸入就用手動，否則用選單
+        val_target = val_input_text if val_input_text else v_sel
         
         if st.button("💰 計算合理價", type="primary"):
-            if not val_target: st.error("請輸入代號")
+            if not val_target: st.error("請輸入代號或選擇持股")
             else:
-                with st.spinner("讀取財報數據中..."):
+                with st.spinner(f"正在計算 {val_target} 合理價..."):
                     res = calculate_fair_value(val_target)
                     if res and res['price']:
                         c1, c2, c3 = st.columns(3)
@@ -647,20 +644,24 @@ elif page == "🛠️ 投資工具箱":
                         else: c3.info("無成長率數據")
                     else: st.error("無法取得財報數據")
 
-    # --- Tab 3: 個股診斷 (Smart Selector) ---
+    # --- Tab 3: 個股診斷 (Smart Selector + V34.2 FIX) ---
     with tab3:
         with st.expander("📖 說明書：怎麼看五力雷達圖？"):
             st.caption("圖形面積越大越好。\n- **獲利**：公司賺錢能力。\n- **成長**：營收是否在增加。\n- **估值**：越靠外圈代表越便宜。\n- **股息**：殖利率高低。\n- **ROE**：股東權益報酬率。")
         
-        # Smart Selector
+        # ★★★ V34.2 FIX ★★★
         col_d1, col_d2 = st.columns([1,1])
         with col_d1: d_sel = st.selectbox("選擇持股", [""] + my_stocks, key="diag_sel")
-        with col_d2: target = st.text_input("或輸入代號", value=d_sel, key="diag_inp").upper().strip()
+        with col_d2: diag_input_text = st.text_input("或輸入代號", key="diag_inp").upper().strip()
+        
+        target = diag_input_text if diag_input_text else d_sel
         
         if st.button("🚀 診斷", key="diag_btn_simple"):
-            with st.spinner("分析中..."):
-                st.plotly_chart(draw_k_line(target), use_container_width=True)
-                st.plotly_chart(draw_radar(target), use_container_width=True)
+            if not target: st.error("請輸入代號")
+            else:
+                with st.spinner(f"正在分析 {target}..."):
+                    st.plotly_chart(draw_k_line(target), use_container_width=True)
+                    st.plotly_chart(draw_radar(target), use_container_width=True)
 
     # --- Tab 4: 選股獵人 ---
     with tab4:
@@ -685,7 +686,7 @@ elif page == "🛠️ 投資工具箱":
                     else: st.error("無法生成圖表")
         else: st.warning("持股數量不足 2 支，無法計算相關性。")
 
-    # --- Tab 6: 事件雷達 (Smart Selector) ---
+    # --- Tab 6: 事件雷達 (Smart Selector + V34.2 FIX) ---
     with tab6:
         st.markdown("### 💣 財報與除息雷達")
         with st.expander("📖 說明書：為什麼要避開財報日？"):
@@ -696,17 +697,13 @@ elif page == "🛠️ 投資工具箱":
             if st.button("📡 掃描所有持股事件", type="primary", use_container_width=True):
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                
                 for i, symbol in enumerate(my_stocks):
                     progress = (i + 1) / len(my_stocks)
                     progress_bar.progress(progress)
                     status_text.caption(f"正在掃描 {symbol}...")
-                    
                     with st.expander(f"{symbol} 事件與新聞", expanded=False):
                         try:
                             stock = yf.Ticker(symbol)
-                            
-                            # 1. 抓行事曆 (未來事件)
                             cal = stock.calendar
                             has_calendar = False
                             if cal and isinstance(cal, dict) and 'Earnings Date' in cal:
@@ -716,32 +713,27 @@ elif page == "🛠️ 投資工具箱":
                                 st.dataframe(cal)
                                 has_calendar = True
                             
-                            if not has_calendar:
-                                st.info("暫無表定之財報或除息事件。")
+                            if not has_calendar: st.info("暫無表定之財報或除息事件。")
 
-                            # 2. 抓新聞 (無論有無事件都顯示)
                             st.markdown("**📰 最新動態：**")
                             news_items = get_stock_news(symbol)
                             if news_items:
-                                for n in news_items:
-                                    st.write(f"- [{n['title']}]({n['link']}) ({n['time']})")
-                            else:
-                                st.caption("無相關新聞。")
-                                
-                        except Exception as e:
-                            st.error(f"讀取錯誤: {str(e)}")
-                            
+                                for n in news_items: st.write(f"- [{n['title']}]({n['link']}) ({n['time']})")
+                            else: st.caption("無相關新聞。")
+                        except Exception as e: st.error(f"讀取錯誤: {str(e)}")
                 status_text.success("✅ 掃描完成！")
                 progress_bar.empty()
         
-        # 2. 單一查詢 (Smart Selector)
+        # 2. 單一查詢
         st.divider()
         st.caption("或查詢特定代號：")
         
-        # Smart Selector
+        # ★★★ V34.2 FIX ★★★
         col_r1, col_r2 = st.columns([1,1])
         with col_r1: r_sel = st.selectbox("選擇持股", [""] + my_stocks, key="radar_sel")
-        with col_r2: radar_input = st.text_input("或輸入代號", value=r_sel, key="radar_inp").upper().strip()
+        with col_r2: radar_input_text = st.text_input("或輸入代號", key="radar_inp").upper().strip()
+        
+        radar_input = radar_input_text if radar_input_text else r_sel
         
         if st.button("🔍 查詢個股"):
             if not radar_input: st.error("請輸入代號")
@@ -755,10 +747,11 @@ elif page == "🛠️ 投資工具箱":
                     elif cal and not isinstance(cal, dict) and not cal.empty:
                         st.dataframe(cal)
                     else: st.info("無近期表定事件。")
-                    
                     st.markdown("**📰 最新新聞：**")
                     news = get_stock_news(radar_input)
-                    for n in news: st.write(f"- [{n['title']}]({n['link']})")
+                    if news:
+                        for n in news: st.write(f"- [{n['title']}]({n['link']}) ({n['time']})")
+                    else: st.caption("無相關新聞")
                 except: st.error("查無資料")
 
     # --- Tab 7: 組合健檢 ---
