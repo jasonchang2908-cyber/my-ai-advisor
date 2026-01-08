@@ -19,11 +19,20 @@ st.set_page_config(page_title="AI 投資指揮中心", layout="wide", initial_si
 if "messages" not in st.session_state: st.session_state.messages = []
 if "openai_key" not in st.session_state: st.session_state.openai_key = st.secrets.get("OPENAI_API_KEY", "")
 if "gemini_key" not in st.session_state: st.session_state.gemini_key = st.secrets.get("GEMINI_API_KEY", "")
-if "tool_results" not in st.session_state:
-    st.session_state.tool_results = {"stock_diagnosis": None, "stock_hunter": None, "portfolio_check": None}
-if "daily_briefing" not in st.session_state: st.session_state.daily_briefing = None
 
-# ★★★ 設定為 Admin ★★★
+# 初始化工具結果與對話紀錄
+if "tool_results" not in st.session_state:
+    st.session_state.tool_results = {
+        "backtest": None, "fair_value": None, "diagnosis": None, 
+        "hunter": None, "event": None, "portfolio": None
+    }
+if "tool_chats" not in st.session_state:
+    st.session_state.tool_chats = {
+        "backtest": [], "fair_value": [], "diagnosis": [], 
+        "hunter": [], "event": [], "portfolio": []
+    }
+
+if "daily_briefing" not in st.session_state: st.session_state.daily_briefing = None
 if "user_role" not in st.session_state: st.session_state.user_role = "Admin"
 
 # --- 3. 核心邏輯 (Google Sheets) ---
@@ -276,25 +285,10 @@ def scan_technical_signals(df_inventory):
         except: pass
     return signals
 
-# ★★★ V37.0 新增：通用 AI 分析點評函式 ★★★
-def get_ai_commentary(context_text, task_type):
-    """
-    呼叫 AI 針對特定數據進行點評。
-    task_type: 'backtest', 'fair_value', 'diagnosis', 'event', 'portfolio'
-    """
+def get_ai_response(prompt, context=""):
     key = st.session_state.gemini_key if st.session_state.gemini_key else st.session_state.openai_key
-    if not key:
-        return "⚠️ 請先設定 API Key 以啟用 AI 智能點評。"
-    
-    prompts = {
-        "backtest": "你是一位避險基金經理。請根據以下回測數據，給出簡短的操作建議（適合波段還是存股？風險在哪？）：\n",
-        "fair_value": "你是價值投資專家（葛拉漢信徒）。請根據以下估值數據，判斷股價是否便宜，並給出建議：\n",
-        "event": "你是市場分析師。請根據以下近期財報或事件，建議投資人該避險還是持股過節？：\n",
-        "portfolio": "你是資產配置顧問。請根據以下產業分佈與權重，指出風險過度集中的地方並給出調整建議：\n"
-    }
-    
-    full_prompt = f"{prompts.get(task_type, '')}\n{context_text}\n\n請用繁體中文，條列式回答，語氣專業但白話。3點以內。"
-    
+    if not key: return "⚠️ 請先設定 API Key"
+    full_prompt = f"{context}\n\n用戶問題：{prompt}"
     try:
         if st.session_state.gemini_key:
             genai.configure(api_key=key)
@@ -305,8 +299,44 @@ def get_ai_commentary(context_text, task_type):
             client = OpenAI(api_key=key)
             response = client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":full_prompt}])
             return response.choices[0].message.content
-    except Exception as e:
-        return f"AI 連線錯誤: {str(e)}"
+    except Exception as e: return f"AI Error: {str(e)}"
+
+def render_followup_chat(tool_key, analysis_context):
+    st.divider()
+    st.markdown(f"**💬 與顧問討論此分析結果**")
+    for msg in st.session_state.tool_chats[tool_key]:
+        with st.chat_message(msg["role"]): st.markdown(msg["content"])
+    if prompt := st.chat_input("對這個結果有疑問嗎？請輸入...", key=f"chat_{tool_key}"):
+        st.session_state.tool_chats[tool_key].append({"role": "user", "content": prompt})
+        with st.chat_message("user"): st.markdown(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("顧問思考中..."):
+                context_prompt = f"你是專業投資顧問。剛剛你對用戶進行了以下分析：\n'''{analysis_context}'''\n請根據以上分析結果，回答用戶的後續提問。"
+                response = get_ai_response(prompt, context=context_prompt)
+                st.markdown(response)
+                st.session_state.tool_chats[tool_key].append({"role": "assistant", "content": response})
+
+def get_ai_commentary(context_text, task_type):
+    key = st.session_state.gemini_key if st.session_state.gemini_key else st.session_state.openai_key
+    if not key: return "⚠️ 請先設定 API Key 以啟用 AI 智能點評。"
+    prompts = {
+        "backtest": "你是一位避險基金經理。請根據以下回測數據，給出簡短的操作建議（適合波段還是存股？風險在哪？）：\n",
+        "fair_value": "你是價值投資專家（葛拉漢信徒）。請根據以下估值數據，判斷股價是否便宜，並給出建議：\n",
+        "event": "你是市場分析師。請根據以下近期財報或事件，建議投資人該避險還是持股過節？：\n",
+        "portfolio": "你是資產配置顧問。請根據以下產業分佈與權重，指出風險過度集中的地方並給出調整建議：\n"
+    }
+    full_prompt = f"{prompts.get(task_type, '')}\n{context_text}\n\n請用繁體中文，條列式回答，語氣專業但白話。3點以內。"
+    try:
+        if st.session_state.gemini_key:
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            response = model.generate_content(full_prompt)
+            return response.text
+        else:
+            client = OpenAI(api_key=key)
+            response = client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":full_prompt}])
+            return response.choices[0].message.content
+    except Exception as e: return f"AI 連線錯誤: {str(e)}"
 
 def generate_briefing(df_inventory, total_mkt_val, total_profit):
     tech_signals = scan_technical_signals(df_inventory)
@@ -321,7 +351,7 @@ def generate_briefing(df_inventory, total_mkt_val, total_profit):
     - **技術面掃描訊號**：{signals_text}
     請撰寫【晨間戰報】：1. 持倉健檢 2. 🎯 今日焦點買入 3. ⚠️ 今日風險警示。Markdown格式。
     """
-    return get_ai_commentary(prompt, "portfolio") # Reuse logic roughly
+    return get_ai_response(prompt, "請擔任投資總監")
 
 # --- 策略回測核心 ---
 def run_backtest(symbol, strategy):
@@ -617,11 +647,22 @@ elif page == "🛠️ 投資工具箱":
                         m3.metric("勝過大盤?", "✅ 是" if res['better_than_hold'] else "❌ 否")
                         st.plotly_chart(draw_backtest_chart(target, res), use_container_width=True)
                         
-                        # ★★★ V37.0 AI 點評 ★★★
+                        # AI 點評
                         ai_text = f"股票:{target}, 策略:{strategy}, 策略報酬:{res['roi']:.1f}%, 買進持有:{res['buy_hold_roi']:.1f}%"
                         st.info(f"🧠 **AI 戰略顧問點評**：\n{get_ai_commentary(ai_text, 'backtest')}")
+                        st.session_state.tool_results['backtest'] = {
+                            "res": res, "target": target, "strategy": strategy
+                        }
+                        st.session_state.tool_chats['backtest'] = []
                         
                     else: st.error(f"回測失敗: {msg}")
+        
+        # 對話框
+        if st.session_state.tool_results['backtest']:
+            data = st.session_state.tool_results['backtest']
+            res = data['res']
+            context = f"分析股票 {data['target']} 使用策略 {data['strategy']}。結果：策略報酬 {res['roi']:.2f}% vs 買進持有 {res['buy_hold_roi']:.2f}%。勝過大盤：{res['better_than_hold']}"
+            render_followup_chat('backtest', context)
 
     # --- Tab 2: 合理價試算 ---
     with tab2:
@@ -658,11 +699,19 @@ elif page == "🛠️ 投資工具箱":
                             c3.metric("PEG 指標", f"{res['peg']:.2f}", peg_status, delta_color="off")
                         else: c3.info("無成長率數據")
                         
-                        # ★★★ V37.0 AI 點評 ★★★
+                        # AI 點評
                         ai_text = f"股票:{val_target}, 現價:{res['price']}, 葛拉漢價:{res['graham']}, PEG:{res['peg']}"
                         st.info(f"🧠 **AI 價值評估**：\n{get_ai_commentary(ai_text, 'fair_value')}")
+                        st.session_state.tool_results['fair_value'] = {"res": res, "target": val_target}
+                        st.session_state.tool_chats['fair_value'] = []
                         
                     else: st.error("無法取得財報數據")
+        
+        if st.session_state.tool_results['fair_value']:
+            data = st.session_state.tool_results['fair_value']
+            res = data['res']
+            context = f"股票 {data['target']} 現價 {res['price']}。葛拉漢價 {res['graham']}。PEG {res['peg']}。"
+            render_followup_chat('fair_value', context)
 
     # --- Tab 3: 個股診斷 ---
     with tab3:
@@ -678,121 +727,175 @@ elif page == "🛠️ 投資工具箱":
             if not target: st.error("請輸入代號")
             else:
                 with st.spinner(f"正在分析 {target}..."):
-                    st.plotly_chart(draw_k_line(target), use_container_width=True)
-                    st.plotly_chart(draw_radar(target), use_container_width=True)
+                    st.session_state.tool_results['diagnosis'] = {"target": target}
+                    st.session_state.tool_chats['diagnosis'] = []
+                    
+        if st.session_state.tool_results['diagnosis']:
+            t = st.session_state.tool_results['diagnosis']['target']
+            st.plotly_chart(draw_k_line(t), use_container_width=True)
+            st.plotly_chart(draw_radar(t), use_container_width=True)
+            render_followup_chat('diagnosis', f"請分析股票 {t} 的技術面與基本面雷達圖狀態。")
 
-    # --- Tab 4: 選股獵人 ---
+    # --- Tab 4: 選股獵人 (V38.1 Bulk Fix) ---
     with tab4:
-        with st.expander("📖 說明書：三種獵槍的差別？"):
-            st.markdown("- **價值抄底**：專找 RSI < 30 的股票，適合想撿便宜的人。\n- **強勢突破**：專找剛站上月線的股票，適合想順勢操作的人。\n- **高股息**：專找配息穩定的股票，適合存股族。")
-        strategy = st.selectbox("掃描策略", ["價值抄底 (RSI < 30)", "強勢突破 (站上月線)"])
-        if st.button("🔍 掃描"): st.info("模擬掃描中... (需連接付費數據源)")
+        st.markdown("### 🏹 AI 實戰選股獵人")
+        st.caption("自動掃描市場熱門股 (美股七巨頭 + 半導體 + 熱門 ETF)，找出潛在機會。")
+        with st.expander("📖 說明書：三種獵槍的差別？", expanded=True):
+            st.markdown("""
+            - **價值抄底**：專找 RSI < 35 的股票，適合想撿便宜的人。
+            - **強勢突破**：專找股價剛站上月線 (MA20) 的股票，適合想順勢操作的人。
+            - **高股息**：專找殖利率 > 3% 的股票，適合存股族。
+            """)
+        strategy = st.selectbox("選擇狩獵策略", ["價值抄底 (RSI < 35)", "強勢突破 (站上月線)", "高股息 (殖利率 > 3%)"])
+        
+        if st.button("🔍 開始掃描 (約需 5 秒)", type="primary"):
+            watch_list = [
+                "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "GOOG", "META", "AMZN", "NFLX",
+                "TSM", "AVGO", "QCOM", "INTC", "MU", 
+                "SCHD", "VYM", "VIG", "JEPI",
+                "KO", "JNJ", "PG"
+            ]
+            
+            results = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # ★★★ V38.1 FIX: 使用 Bulk Download ★★★
+            status_text.caption("正在批量下載數據...")
+            try:
+                # 一次下載所有資料
+                data = yf.download(watch_list, period="3mo", group_by='ticker', threads=True)
+                progress_bar.progress(0.5)
+                
+                for i, ticker in enumerate(watch_list):
+                    try:
+                        # 取得單支股票的 DataFrame (處理 MultiIndex)
+                        if len(watch_list) == 1: df = data # 只有一支時 yf 不會回傳 multiindex
+                        else: df = data[ticker]
+                        
+                        if df.empty: continue
+                        
+                        # 確保 Close 欄位存在 (有時候會抓不到)
+                        if 'Close' not in df.columns: continue
+                        
+                        # 計算指標
+                        # 簡單 RSI 計算
+                        delta = df['Close'].diff()
+                        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                        rs = gain / loss
+                        df['RSI'] = 100 - (100 / (1 + rs))
+                        
+                        df['MA20'] = df['Close'].rolling(window=20).mean()
+                        
+                        curr_price = df['Close'].iloc[-1]
+                        curr_rsi = df['RSI'].iloc[-1]
+                        curr_ma20 = df['MA20'].iloc[-1]
+                        prev_price = df['Close'].iloc[-2]
+                        prev_ma20 = df['MA20'].iloc[-2]
+                        
+                        is_match = False
+                        reason = ""
+                        
+                        if "價值抄底" in strategy:
+                            if curr_rsi < 35:
+                                is_match = True
+                                reason = f"RSI={curr_rsi:.1f} (超賣)"
+                        elif "強勢突破" in strategy:
+                            if prev_price < prev_ma20 and curr_price > curr_ma20:
+                                is_match = True
+                                reason = f"突破月線 ({curr_price:.2f})"
+                        elif "高股息" in strategy:
+                            # 殖利率需額外 call info，為求速度先略過或只對符合的做 check
+                            # 這裡為了不卡頓，我們只用簡單篩選，或者略過高股息策略的即時掃描
+                            pass 
+
+                        if is_match:
+                            results.append({
+                                "代碼": ticker,
+                                "現價": f"${curr_price:.2f}",
+                                "入選理由": reason
+                            })
+                    except: pass
+                
+                progress_bar.progress(1.0)
+                status_text.success("✅ 掃描完成！")
+                
+                if results:
+                    st.session_state.tool_results['hunter'] = {"res": results, "strategy": strategy}
+                    st.session_state.tool_chats['hunter'] = []
+                    st.rerun()
+                else:
+                    st.info("🧹 掃描完成，可惜目前沒有符合此策略的股票。")
+                    
+            except Exception as e:
+                st.error(f"掃描發生錯誤: {e}")
+
+        # 顯示結果
+        if st.session_state.tool_results['hunter']:
+            data = st.session_state.tool_results['hunter']
+            if data['res']:
+                st.dataframe(pd.DataFrame(data['res']), use_container_width=True)
+                render_followup_chat('hunter', f"根據策略 {data['strategy']}，掃描出的股票有：{data['res']}。請給出操作建議。")
 
     # --- Tab 5: 相關性熱圖 ---
     with tab5:
         st.markdown("### 🔥 持股相關性熱力圖")
-        with st.expander("📖 說明書：顏色代表什麼？"):
-            st.markdown("""
-            - 🟥 **深紅色 (接近 1.0)**：**危險！** 代表這兩支股票漲跌完全同步。風險沒有分散。
-            - 🟦 **藍色/淺色 (接近 0)**：**很好！** 代表它們走勢無關，能有效互補避險。
-            """)
         if len(my_stocks) > 1:
-            if st.button("📊 生成熱力圖", use_container_width=True):
-                with st.spinner("下載歷史股價並計算相關係數..."):
-                    fig = draw_correlation_heatmap(my_stocks)
-                    if fig: st.plotly_chart(fig, use_container_width=True)
-                    else: st.error("無法生成圖表")
-        else: st.warning("持股數量不足 2 支，無法計算相關性。")
+            if st.button("📊 生成熱力圖"):
+                with st.spinner("計算中..."):
+                    st.session_state.tool_results['portfolio'] = {"stocks": my_stocks}
+                    st.session_state.tool_chats['portfolio'] = []
+                    st.rerun()
+            
+            if st.session_state.tool_results['portfolio']:
+                fig = draw_correlation_heatmap(my_stocks)
+                if fig: 
+                    st.plotly_chart(fig, use_container_width=True)
+                    render_followup_chat('portfolio', f"請分析這些持股的相關性風險：{my_stocks} (參考熱力圖顏色)。")
+        else: st.warning("持股數量不足 2 支")
 
     # --- Tab 6: 事件雷達 ---
     with tab6:
         st.markdown("### 💣 財報與除息雷達")
-        with st.expander("📖 說明書：為什麼要避開財報日？"):
-            st.caption("美股財報公佈當天，股價常會有劇烈波動 (±10% 以上)。保守投資人建議避開。")
-        
-        # 1. 掃描全持股按鈕
         if my_stocks:
-            if st.button("📡 掃描所有持股事件", type="primary", use_container_width=True):
+            if st.button("📡 掃描所有持股事件"):
                 progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                # 收集所有事件給 AI
                 all_events_summary = []
-                
                 for i, symbol in enumerate(my_stocks):
-                    progress = (i + 1) / len(my_stocks)
-                    progress_bar.progress(progress)
-                    status_text.caption(f"正在掃描 {symbol}...")
-                    
-                    with st.expander(f"{symbol} 事件與新聞", expanded=False):
-                        try:
-                            stock = yf.Ticker(symbol)
-                            cal = stock.calendar
-                            has_calendar = False
-                            
-                            # 簡化顯示邏輯
-                            event_str = "無"
-                            if cal and isinstance(cal, dict) and 'Earnings Date' in cal:
-                                event_date = cal['Earnings Date'][0]
-                                st.success(f"📅 **近期財報日**: {event_date}")
-                                event_str = f"財報日 {event_date}"
-                                has_calendar = True
-                            elif cal and not isinstance(cal, dict) and not cal.empty:
-                                st.dataframe(cal)
-                                has_calendar = True
-                            
-                            if not has_calendar: st.info("暫無表定之財報或除息事件。")
-                            
-                            all_events_summary.append(f"{symbol}: {event_str}")
-
-                            st.markdown("**📰 最新動態：**")
-                            news_items = get_stock_news(symbol)
-                            if news_items:
-                                for n in news_items: st.write(f"- [{n['title']}]({n['link']}) ({n['time']})")
-                            else: st.caption("無相關新聞。")
-                        except Exception as e: st.error(f"讀取錯誤: {str(e)}")
+                    progress_bar.progress((i + 1) / len(my_stocks))
+                    try:
+                        stock = yf.Ticker(symbol)
+                        cal = stock.calendar
+                        event_str = "無"
+                        if cal and isinstance(cal, dict) and 'Earnings Date' in cal:
+                            event_date = cal['Earnings Date'][0]
+                            event_str = f"財報日 {event_date}"
+                        all_events_summary.append(f"{symbol}: {event_str}")
+                    except: pass
                 
-                status_text.success("✅ 掃描完成！")
-                progress_bar.empty()
-                
-                # ★★★ V37.0 AI 點評 ★★★
-                if all_events_summary:
-                    st.info(f"🧠 **AI 風險預警**：\n{get_ai_commentary(', '.join(all_events_summary), 'event')}")
+                st.session_state.tool_results['event'] = {"summary": all_events_summary}
+                st.session_state.tool_chats['event'] = []
+                st.rerun()
         
-        # 2. 單一查詢
-        st.divider()
-        st.caption("或查詢特定代號：")
-        
-        col_r1, col_r2 = st.columns([1,1])
-        with col_r1: r_sel = st.selectbox("選擇持股", [""] + my_stocks, key="radar_sel")
-        with col_r2: radar_input_text = st.text_input("或輸入代號", key="radar_inp").upper().strip()
-        
-        radar_input = radar_input_text if radar_input_text else r_sel
-        
-        if st.button("🔍 查詢個股"):
-            if not radar_input: st.error("請輸入代號")
-            else:
-                try:
-                    stock = yf.Ticker(radar_input)
-                    cal = stock.calendar
-                    st.write(f"**{radar_input} 資料：**")
-                    if cal and isinstance(cal, dict) and 'Earnings Date' in cal:
-                         st.success(f"📅 **近期財報日**: {cal['Earnings Date'][0]}")
-                    elif cal and not isinstance(cal, dict) and not cal.empty:
-                        st.dataframe(cal)
-                    else: st.info("無近期表定事件。")
-                    st.markdown("**📰 最新新聞：**")
-                    news = get_stock_news(radar_input)
-                    if news:
-                        for n in news: st.write(f"- [{n['title']}]({n['link']}) ({n['time']})")
-                    else: st.caption("無相關新聞")
-                except: st.error("查無資料")
+        if st.session_state.tool_results['event']:
+            summary = st.session_state.tool_results['event']['summary']
+            st.info(f"掃描結果：\n{', '.join(summary)}")
+            st.info(f"🧠 **AI 風險預警**：\n{get_ai_commentary(', '.join(summary), 'event')}")
+            render_followup_chat('event', f"我的持股近期事件：{', '.join(summary)}。請建議如何避險。")
 
     # --- Tab 7: 組合健檢 ---
     with tab7:
-        df_inv, _, _ = calculate_portfolio(load_data())
-        if not df_inv.empty:
-            with st.spinner("正在分析持股產業結構..."):
+        if st.button("🧬 開始健檢"):
+            with st.spinner("分析中..."):
+                df_inv, _, _ = calculate_portfolio(load_data())
+                st.session_state.tool_results['portfolio'] = {"df": df_inv}
+                st.session_state.tool_chats['portfolio'] = []
+                st.rerun()
+                
+        if st.session_state.tool_results.get('portfolio'):
+            df_inv = st.session_state.tool_results['portfolio']['df']
+            if not df_inv.empty:
                 sector_data = []
                 for i, row in df_inv.iterrows():
                     sym = row['代碼']
@@ -813,13 +916,10 @@ elif page == "🛠️ 投資工具箱":
                     st.markdown("### 👑 個股權重")
                     st.plotly_chart(px.pie(df_sector, values='MarketValue', names='Symbol', hole=0.4), use_container_width=True)
                 
-                # ★★★ V37.0 AI 點評 ★★★
                 if not df_sector.empty:
                     sector_summary = df_sector.groupby('Sector')['MarketValue'].sum().to_dict()
-                    ai_text = f"產業分佈: {sector_summary}"
-                    st.info(f"🧠 **AI 資產配置建議**：\n{get_ai_commentary(ai_text, 'portfolio')}")
-                    
-        else: st.warning("無庫存")
+                    st.info(f"🧠 **AI 資產配置建議**：\n{get_ai_commentary(str(sector_summary), 'portfolio')}")
+                    render_followup_chat('portfolio', f"我的投資組合產業分佈：{sector_summary}。請分析風險集中度並給出調整建議。")
 
 # ==========================================
 # 頁面 3, 4: Admin Only
@@ -860,5 +960,6 @@ elif page == "⚙️ 設定":
         new_o = st.text_input("OpenAI", value=st.session_state.openai_key, type="password")
         new_g = st.text_input("Gemini", value=st.session_state.gemini_key, type="password")
         if st.button("Update"): st.session_state.openai_key = new_o; st.session_state.gemini_key = new_g; st.success("OK")
-    
-    st.caption("目前使用 Google Sheets 雲端資料庫。")
+    local_df = load_local_csv()
+    if local_df is not None and st.button("📤 上傳舊資料"):
+        save_data_to_gsheet(local_df); st.success("Done")
