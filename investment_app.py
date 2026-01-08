@@ -73,6 +73,27 @@ def save_data_to_gsheet(df):
         return True
     except: return False
 
+# ★★★ V39.1 FIX: 補回 load_local_csv ★★★
+def load_local_csv():
+    local_file = 'my_portfolio.csv'
+    if os.path.exists(local_file):
+        try:
+            df = pd.read_csv(local_file)
+            if 'BuyDate' in df.columns: df = df.rename(columns={'BuyDate': 'Date'})
+            if 'Cost' in df.columns: df = df.rename(columns={'Cost': 'Price'})
+            if 'Action' not in df.columns: df['Action'] = 'Buy'
+            required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
+            for col in required_cols:
+                if col not in df.columns:
+                    if col == "Account": df[col] = "TFSA"
+                    elif col == "Date": df[col] = str(date.today())
+                    else: df[col] = ""
+            df = df[required_cols]
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+            return df
+        except: return None
+    return None
+
 def calculate_portfolio(df_transactions):
     if df_transactions.empty: return pd.DataFrame(), 0, 0
     holdings = {}
@@ -142,40 +163,32 @@ def get_usdcad_rate():
     try: return yf.Ticker("CAD=X").history(period="1d")['Close'].iloc[-1]
     except: return 1.35
 
-# ★★★ V39.0 FIX: 穩定的 Google News RSS 抓取函式 ★★★
+# Google News RSS
 def get_stock_news(symbol):
     news_items = []
     try:
-        # 使用 Google News RSS (繁體中文)，針對個股查詢
-        # 如果是台股 (如 2330.TW)，Google News 搜尋 "2330.TW" 通常能抓到正確新聞
-        # 如果是美股 (如 AAPL)，搜尋 "AAPL stock" 或 "AAPL"
-        
         query = f"{symbol}"
         if not symbol.endswith(".TW") and not symbol.endswith(".TWO"):
-             query += " stock" # 美股加個 stock 關鍵字比較準
+             query += " stock"
              
         url = f"https://news.google.com/rss/search?q={query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         
-        # 設定 User-Agent 避免被擋
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         response = requests.get(url, headers=headers, timeout=5)
         
         if response.status_code == 200:
             root = ET.fromstring(response.content)
-            # 解析 XML
-            for item in root.findall('./channel/item')[:3]: # 只取前 3 則
+            for item in root.findall('./channel/item')[:3]:
                 try:
                     title = item.find('title').text
                     link = item.find('link').text
                     pub_date_str = item.find('pubDate').text
                     
-                    # 處理日期格式 (從 RSS RFC 822 格式轉為 YYYY-MM-DD)
-                    # 例如: "Wed, 07 Jan 2026 10:00:00 GMT" -> "2026-01-07"
                     try:
                         dt = parsedate_to_datetime(pub_date_str)
-                        date_str = dt.strftime('%Y-%m-%d') # 只顯示日期
+                        date_str = dt.strftime('%Y-%m-%d')
                     except:
-                        date_str = "Recent" # 解析失敗時的備案
+                        date_str = "Recent"
 
                     if title and link:
                         news_items.append({
@@ -703,7 +716,7 @@ elif page == "🛠️ 投資工具箱":
         st.markdown("### ⚖️ 價值投資計算器 (Graham/Lynch)")
         with st.expander("📖 說明書：股價多少算便宜？"):
             st.info("""
-            - **葛拉漢數字 (Graham Number)**：這是最保守的估值，適合傳統產業。如果 **現價 < 葛拉漢價**，代表非常有安全邊際。
+            - **葛拉漢數字 (Graham Number)**：這是最保守的估值，適合傳統產業。如果 **現價 <葛拉漢價**，代表非常有安全邊際。
             - **PEG 指標**：這是成長股神器 (彼得林區最愛)。
                 - **PEG < 1**：✅ 便宜 (成長速度 > 本益比)。
                 - **PEG > 1.5**：⚠️ 昂貴 (股價可能透支了未來的成長)。
