@@ -64,6 +64,27 @@ def save_data_to_gsheet(df):
         return True
     except: return False
 
+# ★★★ V34.3 FIX: 補回缺失的 load_local_csv 函式 ★★★
+def load_local_csv():
+    local_file = 'my_portfolio.csv'
+    if os.path.exists(local_file):
+        try:
+            df = pd.read_csv(local_file)
+            if 'BuyDate' in df.columns: df = df.rename(columns={'BuyDate': 'Date'})
+            if 'Cost' in df.columns: df = df.rename(columns={'Cost': 'Price'})
+            if 'Action' not in df.columns: df['Action'] = 'Buy'
+            required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
+            for col in required_cols:
+                if col not in df.columns:
+                    if col == "Account": df[col] = "TFSA"
+                    elif col == "Date": df[col] = str(date.today())
+                    else: df[col] = ""
+            df = df[required_cols]
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+            return df
+        except: return None
+    return None
+
 def calculate_portfolio(df_transactions):
     if df_transactions.empty: return pd.DataFrame(), 0, 0
     holdings = {}
@@ -133,39 +154,29 @@ def get_usdcad_rate():
     try: return yf.Ticker("CAD=X").history(period="1d")['Close'].iloc[-1]
     except: return 1.35
 
-# ★★★ V34.2 修復：改用 Google News RSS 確保資料穩定 ★★★
+# ★★★ Google News RSS ★★★
 def get_stock_news(symbol):
     news_items = []
     try:
-        # 使用 Google News RSS (繁體中文)
         url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         response = requests.get(url, timeout=5)
         
         if response.status_code == 200:
             root = ET.fromstring(response.content)
-            # 解析 XML
             for item in root.findall('./channel/item')[:3]:
                 try:
                     title = item.find('title').text
                     link = item.find('link').text
                     pub_date_str = item.find('pubDate').text
-                    
-                    # 處理日期格式 (從 RSS 格式轉為 YYYY-MM-DD)
                     try:
                         dt = parsedate_to_datetime(pub_date_str)
                         date_str = dt.strftime('%Y-%m-%d')
-                    except:
-                        date_str = "Recent"
+                    except: date_str = "Recent"
 
                     if title and link:
-                        news_items.append({
-                            'title': title,
-                            'link': link,
-                            'time': date_str
-                        })
+                        news_items.append({'title': title, 'link': link, 'time': date_str})
                 except: continue
-    except Exception as e:
-        print(f"News Error: {e}")
+    except Exception as e: print(f"News Error: {e}")
     return news_items
 
 def scan_missing_dividends(df_trans):
@@ -616,12 +627,10 @@ elif page == "🛠️ 投資工具箱":
                 - **PEG > 1.5**：⚠️ 昂貴 (股價可能透支了未來的成長)。
             """)
         
-        # ★★★ V34.2 FIX: 邏輯修正 ★★★
         col_v1, col_v2 = st.columns([1,1])
         with col_v1: v_sel = st.selectbox("選擇持股", [""] + my_stocks, key="fv_sel")
         with col_v2: val_input_text = st.text_input("或輸入代號", key="fv_inp").upper().strip()
         
-        # 決定最終要查的代號：如果有手動輸入就用手動，否則用選單
         val_target = val_input_text if val_input_text else v_sel
         
         if st.button("💰 計算合理價", type="primary"):
@@ -649,7 +658,6 @@ elif page == "🛠️ 投資工具箱":
         with st.expander("📖 說明書：怎麼看五力雷達圖？"):
             st.caption("圖形面積越大越好。\n- **獲利**：公司賺錢能力。\n- **成長**：營收是否在增加。\n- **估值**：越靠外圈代表越便宜。\n- **股息**：殖利率高低。\n- **ROE**：股東權益報酬率。")
         
-        # ★★★ V34.2 FIX ★★★
         col_d1, col_d2 = st.columns([1,1])
         with col_d1: d_sel = st.selectbox("選擇持股", [""] + my_stocks, key="diag_sel")
         with col_d2: diag_input_text = st.text_input("或輸入代號", key="diag_inp").upper().strip()
@@ -728,7 +736,6 @@ elif page == "🛠️ 投資工具箱":
         st.divider()
         st.caption("或查詢特定代號：")
         
-        # ★★★ V34.2 FIX ★★★
         col_r1, col_r2 = st.columns([1,1])
         with col_r1: r_sel = st.selectbox("選擇持股", [""] + my_stocks, key="radar_sel")
         with col_r2: radar_input_text = st.text_input("或輸入代號", key="radar_inp").upper().strip()
