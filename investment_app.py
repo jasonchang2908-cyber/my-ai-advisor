@@ -20,7 +20,7 @@ if "messages" not in st.session_state: st.session_state.messages = []
 if "openai_key" not in st.session_state: st.session_state.openai_key = st.secrets.get("OPENAI_API_KEY", "")
 if "gemini_key" not in st.session_state: st.session_state.gemini_key = st.secrets.get("GEMINI_API_KEY", "")
 
-# ★★★ V38.4 FIX: 新增 correlation 獨立鍵值，避免衝突 ★★★
+# 初始化工具結果與對話紀錄
 if "tool_results" not in st.session_state:
     st.session_state.tool_results = {
         "backtest": None, "fair_value": None, "diagnosis": None, 
@@ -72,26 +72,6 @@ def save_data_to_gsheet(df):
         conn.update(data=df_save) 
         return True
     except: return False
-
-def load_local_csv():
-    local_file = 'my_portfolio.csv'
-    if os.path.exists(local_file):
-        try:
-            df = pd.read_csv(local_file)
-            if 'BuyDate' in df.columns: df = df.rename(columns={'BuyDate': 'Date'})
-            if 'Cost' in df.columns: df = df.rename(columns={'Cost': 'Price'})
-            if 'Action' not in df.columns: df['Action'] = 'Buy'
-            required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
-            for col in required_cols:
-                if col not in df.columns:
-                    if col == "Account": df[col] = "TFSA"
-                    elif col == "Date": df[col] = str(date.today())
-                    else: df[col] = ""
-            df = df[required_cols]
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
-            return df
-        except: return None
-    return None
 
 def calculate_portfolio(df_transactions):
     if df_transactions.empty: return pd.DataFrame(), 0, 0
@@ -162,29 +142,50 @@ def get_usdcad_rate():
     try: return yf.Ticker("CAD=X").history(period="1d")['Close'].iloc[-1]
     except: return 1.35
 
-# Google News RSS
+# ★★★ V39.0 FIX: 穩定的 Google News RSS 抓取函式 ★★★
 def get_stock_news(symbol):
     news_items = []
     try:
-        url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-        response = requests.get(url, timeout=5)
+        # 使用 Google News RSS (繁體中文)，針對個股查詢
+        # 如果是台股 (如 2330.TW)，Google News 搜尋 "2330.TW" 通常能抓到正確新聞
+        # 如果是美股 (如 AAPL)，搜尋 "AAPL stock" 或 "AAPL"
+        
+        query = f"{symbol}"
+        if not symbol.endswith(".TW") and not symbol.endswith(".TWO"):
+             query += " stock" # 美股加個 stock 關鍵字比較準
+             
+        url = f"https://news.google.com/rss/search?q={query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        
+        # 設定 User-Agent 避免被擋
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        response = requests.get(url, headers=headers, timeout=5)
         
         if response.status_code == 200:
             root = ET.fromstring(response.content)
-            for item in root.findall('./channel/item')[:3]:
+            # 解析 XML
+            for item in root.findall('./channel/item')[:3]: # 只取前 3 則
                 try:
                     title = item.find('title').text
                     link = item.find('link').text
                     pub_date_str = item.find('pubDate').text
+                    
+                    # 處理日期格式 (從 RSS RFC 822 格式轉為 YYYY-MM-DD)
+                    # 例如: "Wed, 07 Jan 2026 10:00:00 GMT" -> "2026-01-07"
                     try:
                         dt = parsedate_to_datetime(pub_date_str)
-                        date_str = dt.strftime('%Y-%m-%d')
-                    except: date_str = "Recent"
+                        date_str = dt.strftime('%Y-%m-%d') # 只顯示日期
+                    except:
+                        date_str = "Recent" # 解析失敗時的備案
 
                     if title and link:
-                        news_items.append({'title': title, 'link': link, 'time': date_str})
+                        news_items.append({
+                            'title': title,
+                            'link': link,
+                            'time': date_str
+                        })
                 except: continue
-    except Exception as e: print(f"News Error: {e}")
+    except Exception as e:
+        print(f"News Error for {symbol}: {e}")
     return news_items
 
 def scan_missing_dividends(df_trans):
@@ -336,7 +337,6 @@ def render_followup_chat(tool_key, analysis_context):
                 st.markdown(response)
                 st.session_state.tool_chats[tool_key].append({"role": "assistant", "content": response})
 
-# ★★★ V38.4 FIX: 新增 correlation 提示詞 ★★★
 def get_ai_commentary(context_text, task_type):
     key = st.session_state.gemini_key if st.session_state.gemini_key else st.session_state.openai_key
     if not key: return "⚠️ 請先設定 API Key 以啟用 AI 智能點評。"
@@ -908,31 +908,79 @@ elif page == "🛠️ 投資工具箱":
     # --- Tab 6: 事件雷達 ---
     with tab6:
         st.markdown("### 💣 財報與除息雷達")
+        
+        # 1. 掃描全持股按鈕
         if my_stocks:
-            if st.button("📡 掃描所有持股事件"):
+            if st.button("📡 掃描所有持股事件 (含新聞)"):
                 progress_bar = st.progress(0)
-                all_events_summary = []
+                status_text = st.empty()
+                all_results = []
+                
                 for i, symbol in enumerate(my_stocks):
                     progress_bar.progress((i + 1) / len(my_stocks))
+                    status_text.caption(f"正在掃描 {symbol}...")
+                    
                     try:
+                        # 1. 財報日 (Yahoo)
                         stock = yf.Ticker(symbol)
                         cal = stock.calendar
                         event_str = "無"
                         if cal and isinstance(cal, dict) and 'Earnings Date' in cal:
-                            event_date = cal['Earnings Date'][0]
-                            event_str = f"財報日 {event_date}"
-                        all_events_summary.append(f"{symbol}: {event_str}")
+                            event_str = f"財報日 {cal['Earnings Date'][0]}"
+                        
+                        # 2. 新聞 (Google RSS)
+                        news = get_stock_news(symbol)
+                        
+                        all_results.append({
+                            "symbol": symbol,
+                            "event": event_str,
+                            "news": news
+                        })
                     except: pass
                 
-                st.session_state.tool_results['event'] = {"summary": all_events_summary}
+                st.session_state.tool_results['event'] = {"results": all_results}
                 st.session_state.tool_chats['event'] = []
                 st.rerun()
         
-        if st.session_state.tool_results['event']:
-            summary = st.session_state.tool_results['event']['summary']
-            st.info(f"掃描結果：\n{', '.join(summary)}")
-            st.info(f"🧠 **AI 風險預警**：\n{get_ai_commentary(', '.join(summary), 'event')}")
-            render_followup_chat('event', f"我的持股近期事件：{', '.join(summary)}。請建議如何避險。")
+        if st.session_state.tool_results.get('event'):
+            results = st.session_state.tool_results['event']['results']
+            
+            # 顯示結果
+            for item in results:
+                with st.expander(f"{item['symbol']} - {item['event']}", expanded=True):
+                    if item['event'] != "無":
+                        st.warning(f"📅 **重要日期**：{item['event']}")
+                    
+                    st.markdown("**📰 最新動態：**")
+                    if item['news']:
+                        for n in item['news']:
+                            st.write(f"- [{n['title']}]({n['link']}) ({n['time']})")
+                    else:
+                        st.caption("無相關新聞")
+
+            # AI 點評
+            summary_text = ", ".join([f"{r['symbol']}:{r['event']}" for r in results if r['event'] != "無"])
+            if summary_text:
+                st.info(f"🧠 **AI 風險預警**：\n{get_ai_commentary(summary_text, 'event')}")
+            
+            render_followup_chat('event', f"我的持股近期事件：{summary_text}。請建議如何避險。")
+            
+        # 2. 單一查詢
+        st.divider()
+        st.caption("或查詢特定代號：")
+        col_r1, col_r2 = st.columns([1,1])
+        with col_r1: r_sel = st.selectbox("選擇持股", [""] + my_stocks, key="radar_sel")
+        with col_r2: radar_input_text = st.text_input("或輸入代號", key="radar_inp").upper().strip()
+        radar_input = radar_input_text if radar_input_text else r_sel
+        
+        if st.button("🔍 查詢個股"):
+            if not radar_input: st.error("請輸入代號")
+            else:
+                news = get_stock_news(radar_input)
+                st.write(f"**{radar_input} 最新新聞：**")
+                if news:
+                    for n in news: st.write(f"- [{n['title']}]({n['link']}) ({n['time']})")
+                else: st.caption("無相關新聞")
 
     # --- Tab 7: 組合健檢 ---
     with tab7:
@@ -961,7 +1009,6 @@ elif page == "🛠️ 投資工具箱":
                 col_chart1, col_chart2 = st.columns(2)
                 with col_chart1:
                     st.markdown("### 🏭 產業分散度")
-                    # ★★★ V38.3 FIX: 使用 safe_plot ★★★
                     safe_plot(px.pie(df_sector, values='MarketValue', names='Sector', hole=0.4))
                 with col_chart2:
                     st.markdown("### 👑 個股權重")
