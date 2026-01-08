@@ -20,16 +20,16 @@ if "messages" not in st.session_state: st.session_state.messages = []
 if "openai_key" not in st.session_state: st.session_state.openai_key = st.secrets.get("OPENAI_API_KEY", "")
 if "gemini_key" not in st.session_state: st.session_state.gemini_key = st.secrets.get("GEMINI_API_KEY", "")
 
-# 初始化工具結果與對話紀錄
+# ★★★ V38.4 FIX: 新增 correlation 獨立鍵值，避免衝突 ★★★
 if "tool_results" not in st.session_state:
     st.session_state.tool_results = {
         "backtest": None, "fair_value": None, "diagnosis": None, 
-        "hunter": None, "event": None, "portfolio": None
+        "hunter": None, "event": None, "portfolio": None, "correlation": None
     }
 if "tool_chats" not in st.session_state:
     st.session_state.tool_chats = {
         "backtest": [], "fair_value": [], "diagnosis": [], 
-        "hunter": [], "event": [], "portfolio": []
+        "hunter": [], "event": [], "portfolio": [], "correlation": []
     }
 
 if "daily_briefing" not in st.session_state: st.session_state.daily_briefing = None
@@ -72,6 +72,26 @@ def save_data_to_gsheet(df):
         conn.update(data=df_save) 
         return True
     except: return False
+
+def load_local_csv():
+    local_file = 'my_portfolio.csv'
+    if os.path.exists(local_file):
+        try:
+            df = pd.read_csv(local_file)
+            if 'BuyDate' in df.columns: df = df.rename(columns={'BuyDate': 'Date'})
+            if 'Cost' in df.columns: df = df.rename(columns={'Cost': 'Price'})
+            if 'Action' not in df.columns: df['Action'] = 'Buy'
+            required_cols = ["Date", "Account", "Action", "Symbol", "Price", "Shares"]
+            for col in required_cols:
+                if col not in df.columns:
+                    if col == "Account": df[col] = "TFSA"
+                    elif col == "Date": df[col] = str(date.today())
+                    else: df[col] = ""
+            df = df[required_cols]
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+            return df
+        except: return None
+    return None
 
 def calculate_portfolio(df_transactions):
     if df_transactions.empty: return pd.DataFrame(), 0, 0
@@ -316,6 +336,7 @@ def render_followup_chat(tool_key, analysis_context):
                 st.markdown(response)
                 st.session_state.tool_chats[tool_key].append({"role": "assistant", "content": response})
 
+# ★★★ V38.4 FIX: 新增 correlation 提示詞 ★★★
 def get_ai_commentary(context_text, task_type):
     key = st.session_state.gemini_key if st.session_state.gemini_key else st.session_state.openai_key
     if not key: return "⚠️ 請先設定 API Key 以啟用 AI 智能點評。"
@@ -323,7 +344,8 @@ def get_ai_commentary(context_text, task_type):
         "backtest": "你是一位避險基金經理。請根據以下回測數據，給出簡短的操作建議（適合波段還是存股？風險在哪？）：\n",
         "fair_value": "你是價值投資專家（葛拉漢信徒）。請根據以下估值數據，判斷股價是否便宜，並給出建議：\n",
         "event": "你是市場分析師。請根據以下近期財報或事件，建議投資人該避險還是持股過節？：\n",
-        "portfolio": "你是資產配置顧問。請根據以下產業分佈與權重，指出風險過度集中的地方並給出調整建議：\n"
+        "portfolio": "你是資產配置顧問。請根據以下產業分佈與權重，指出風險過度集中的地方並給出調整建議：\n",
+        "correlation": "你是量化分析師。請根據以下相關性矩陣摘要（高於0.8為高度相關），指出風險過度集中的標的，並建議如何增加避險（如加入負相關資產）：\n"
     }
     full_prompt = f"{prompts.get(task_type, '')}\n{context_text}\n\n請用繁體中文，條列式回答，語氣專業但白話。3點以內。"
     try:
@@ -353,16 +375,12 @@ def generate_briefing(df_inventory, total_mkt_val, total_profit):
     """
     return get_ai_response(prompt, "請擔任投資總監")
 
-# ★★★ V38.3 FIX: 安全繪圖函式，防止 PlotlyError 崩潰 ★★★
 def safe_plot(fig):
     """如果圖表物件存在且有效，才進行繪製；否則顯示警告。"""
     if fig:
-        try:
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception as e:
-            st.warning(f"⚠️ 圖表繪製失敗: {str(e)}")
-    else:
-        st.caption("⚠️ 無法取得數據以繪製圖表 (可能因資料源暫時無法連線)")
+        try: st.plotly_chart(fig, use_container_width=True)
+        except: st.warning("⚠️ 圖表繪製失敗")
+    else: st.caption("⚠️ 無法取得數據以繪製圖表")
 
 # --- 策略回測核心 ---
 def run_backtest(symbol, strategy):
@@ -410,14 +428,14 @@ def draw_backtest_chart(symbol, res):
 
 # --- V29.0 新增工具 ---
 def draw_correlation_heatmap(tickers):
-    if len(tickers) < 2: return None
+    if len(tickers) < 2: return None, None
     try:
         data = yf.download(tickers, period="6mo")['Close']
-        if data.empty: return None
+        if data.empty: return None, None
         corr = data.pct_change().corr()
         fig = px.imshow(corr, text_auto=True, color_continuous_scale='RdBu_r', title="持股相關性熱力圖 (越紅越危險)")
-        return fig
-    except: return None
+        return fig, corr
+    except: return None, None
 
 def calculate_fair_value(ticker):
     try:
@@ -862,15 +880,29 @@ elif page == "🛠️ 投資工具箱":
         if len(my_stocks) > 1:
             if st.button("📊 生成熱力圖"):
                 with st.spinner("計算中..."):
-                    st.session_state.tool_results['portfolio'] = {"stocks": my_stocks}
-                    st.session_state.tool_chats['portfolio'] = []
+                    st.session_state.tool_results['correlation'] = {"stocks": my_stocks}
+                    st.session_state.tool_chats['correlation'] = []
                     st.rerun()
             
-            if st.session_state.tool_results['portfolio']:
-                # ★★★ V38.3 FIX: 使用 safe_plot ★★★
-                safe_plot(draw_correlation_heatmap(my_stocks))
+            if st.session_state.tool_results.get('correlation'):
+                # ★★★ V38.4 FIX: 使用 safe_plot 與 AI 分析 ★★★
+                fig, corr_matrix = draw_correlation_heatmap(my_stocks)
+                safe_plot(fig)
                 
-                render_followup_chat('portfolio', f"請分析這些持股的相關性風險：{my_stocks} (參考熱力圖顏色)。")
+                if corr_matrix is not None:
+                    # 找出高度相關的配對
+                    high_corr_pairs = []
+                    for i in range(len(corr_matrix.columns)):
+                        for j in range(i+1, len(corr_matrix.columns)):
+                            val = corr_matrix.iloc[i, j]
+                            if val > 0.8:
+                                high_corr_pairs.append(f"{corr_matrix.columns[i]}-{corr_matrix.columns[j]} ({val:.2f})")
+                    
+                    summary = "高度相關配對: " + ", ".join(high_corr_pairs) if high_corr_pairs else "無高度相關配對"
+                    st.info(f"🧠 **AI 風險洞察**：\n{get_ai_commentary(summary, 'correlation')}")
+                    render_followup_chat('correlation', f"我的持股相關性矩陣摘要：{summary}。請分析風險。")
+                else:
+                    st.warning("無法計算相關性 (數據不足)")
         else: st.warning("持股數量不足 2 支")
 
     # --- Tab 6: 事件雷達 ---
