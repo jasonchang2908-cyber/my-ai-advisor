@@ -353,6 +353,17 @@ def generate_briefing(df_inventory, total_mkt_val, total_profit):
     """
     return get_ai_response(prompt, "請擔任投資總監")
 
+# ★★★ V38.3 FIX: 安全繪圖函式，防止 PlotlyError 崩潰 ★★★
+def safe_plot(fig):
+    """如果圖表物件存在且有效，才進行繪製；否則顯示警告。"""
+    if fig:
+        try:
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.warning(f"⚠️ 圖表繪製失敗: {str(e)}")
+    else:
+        st.caption("⚠️ 無法取得數據以繪製圖表 (可能因資料源暫時無法連線)")
+
 # --- 策略回測核心 ---
 def run_backtest(symbol, strategy):
     try:
@@ -383,6 +394,7 @@ def run_backtest(symbol, strategy):
     except Exception as e: return None, str(e)
 
 def draw_backtest_chart(symbol, res):
+    if not res or 'df' not in res or res['df'].empty: return None
     df = res['df']; trades = res['trades']
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name='股價'))
@@ -399,10 +411,13 @@ def draw_backtest_chart(symbol, res):
 # --- V29.0 新增工具 ---
 def draw_correlation_heatmap(tickers):
     if len(tickers) < 2: return None
-    data = yf.download(tickers, period="6mo")['Close']
-    corr = data.pct_change().corr()
-    fig = px.imshow(corr, text_auto=True, color_continuous_scale='RdBu_r', title="持股相關性熱力圖 (越紅越危險)")
-    return fig
+    try:
+        data = yf.download(tickers, period="6mo")['Close']
+        if data.empty: return None
+        corr = data.pct_change().corr()
+        fig = px.imshow(corr, text_auto=True, color_continuous_scale='RdBu_r', title="持股相關性熱力圖 (越紅越危險)")
+        return fig
+    except: return None
 
 def calculate_fair_value(ticker):
     try:
@@ -645,7 +660,8 @@ elif page == "🛠️ 投資工具箱":
                         m1.metric("策略報酬", f"{res['roi']:.1f}%", delta_color="normal" if res['roi']>0 else "inverse")
                         m2.metric("買進持有", f"{res['buy_hold_roi']:.1f}%")
                         m3.metric("勝過大盤?", "✅ 是" if res['better_than_hold'] else "❌ 否")
-                        st.plotly_chart(draw_backtest_chart(target, res), use_container_width=True)
+                        # ★★★ V38.3 FIX: 使用 safe_plot ★★★
+                        safe_plot(draw_backtest_chart(target, res))
                         
                         # AI 點評
                         ai_text = f"股票:{target}, 策略:{strategy}, 策略報酬:{res['roi']:.1f}%, 買進持有:{res['buy_hold_roi']:.1f}%"
@@ -732,8 +748,11 @@ elif page == "🛠️ 投資工具箱":
                     
         if st.session_state.tool_results['diagnosis']:
             t = st.session_state.tool_results['diagnosis']['target']
-            st.plotly_chart(draw_k_line(t), use_container_width=True)
-            st.plotly_chart(draw_radar(t), use_container_width=True)
+            
+            # ★★★ V38.3 FIX: 使用 safe_plot ★★★
+            safe_plot(draw_k_line(t))
+            safe_plot(draw_radar(t))
+
             render_followup_chat('diagnosis', f"請分析股票 {t} 的技術面與基本面雷達圖狀態。")
 
     # --- Tab 4: 選股獵人 (V38.1 Bulk Fix) ---
@@ -763,9 +782,9 @@ elif page == "🛠️ 投資工具箱":
             # ★★★ V38.1 FIX: 使用 Bulk Download ★★★
             status_text.caption("正在批量下載數據...")
             try:
-                # 一次下載所有資料
+                # 一次下載所有資料 (關鍵加速點)
                 data = yf.download(watch_list, period="3mo", group_by='ticker', threads=True)
-                progress_bar.progress(0.5)
+                progress_bar.progress(0.8)
                 
                 for i, ticker in enumerate(watch_list):
                     try:
@@ -779,7 +798,6 @@ elif page == "🛠️ 投資工具箱":
                         if 'Close' not in df.columns: continue
                         
                         # 計算指標
-                        # 簡單 RSI 計算
                         delta = df['Close'].diff()
                         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
                         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -849,10 +867,10 @@ elif page == "🛠️ 投資工具箱":
                     st.rerun()
             
             if st.session_state.tool_results['portfolio']:
-                fig = draw_correlation_heatmap(my_stocks)
-                if fig: 
-                    st.plotly_chart(fig, use_container_width=True)
-                    render_followup_chat('portfolio', f"請分析這些持股的相關性風險：{my_stocks} (參考熱力圖顏色)。")
+                # ★★★ V38.3 FIX: 使用 safe_plot ★★★
+                safe_plot(draw_correlation_heatmap(my_stocks))
+                
+                render_followup_chat('portfolio', f"請分析這些持股的相關性風險：{my_stocks} (參考熱力圖顏色)。")
         else: st.warning("持股數量不足 2 支")
 
     # --- Tab 6: 事件雷達 ---
@@ -911,10 +929,11 @@ elif page == "🛠️ 投資工具箱":
                 col_chart1, col_chart2 = st.columns(2)
                 with col_chart1:
                     st.markdown("### 🏭 產業分散度")
-                    st.plotly_chart(px.pie(df_sector, values='MarketValue', names='Sector', hole=0.4), use_container_width=True)
+                    # ★★★ V38.3 FIX: 使用 safe_plot ★★★
+                    safe_plot(px.pie(df_sector, values='MarketValue', names='Sector', hole=0.4))
                 with col_chart2:
                     st.markdown("### 👑 個股權重")
-                    st.plotly_chart(px.pie(df_sector, values='MarketValue', names='Symbol', hole=0.4), use_container_width=True)
+                    safe_plot(px.pie(df_sector, values='MarketValue', names='Symbol', hole=0.4))
                 
                 if not df_sector.empty:
                     sector_summary = df_sector.groupby('Sector')['MarketValue'].sum().to_dict()
@@ -960,6 +979,7 @@ elif page == "⚙️ 設定":
         new_o = st.text_input("OpenAI", value=st.session_state.openai_key, type="password")
         new_g = st.text_input("Gemini", value=st.session_state.gemini_key, type="password")
         if st.button("Update"): st.session_state.openai_key = new_o; st.session_state.gemini_key = new_g; st.success("OK")
+    
     local_df = load_local_csv()
     if local_df is not None and st.button("📤 上傳舊資料"):
         save_data_to_gsheet(local_df); st.success("Done")
