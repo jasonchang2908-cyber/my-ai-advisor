@@ -133,6 +133,7 @@ def get_usdcad_rate():
     try: return yf.Ticker("CAD=X").history(period="1d")['Close'].iloc[-1]
     except: return 1.35
 
+# Google News RSS
 def get_stock_news(symbol):
     news_items = []
     try:
@@ -340,7 +341,6 @@ def draw_backtest_chart(symbol, res):
     fig.update_layout(title=f"{symbol} 策略回測圖", height=400)
     return fig
 
-# --- V29.0 新增工具 ---
 def draw_correlation_heatmap(tickers):
     if len(tickers) < 2: return None
     data = yf.download(tickers, period="6mo")['Close']
@@ -563,7 +563,7 @@ elif page == "🛠️ 投資工具箱":
     df_trans = load_data()
     my_stocks = df_trans['Symbol'].unique().tolist() if not df_trans.empty else []
 
-    # --- Tab 1: 策略回測 (Smart Selector) ---
+    # --- Tab 1: 策略回測 ---
     with tab1:
         st.markdown("### 🤖 策略回測實驗室")
         with st.expander("📖 說明書：如何看回測訊號？", expanded=True):
@@ -592,7 +592,7 @@ elif page == "🛠️ 投資工具箱":
                         st.plotly_chart(draw_backtest_chart(target, res), use_container_width=True)
                     else: st.error(f"回測失敗: {msg}")
 
-    # --- Tab 2: 合理價試算 (Smart Selector + V34.2 FIX) ---
+    # --- Tab 2: 合理價試算 (V34.2 Smart Selector Fix) ---
     with tab2:
         st.markdown("### ⚖️ 價值投資計算器 (Graham/Lynch)")
         with st.expander("📖 說明書：股價多少算便宜？"):
@@ -603,12 +603,11 @@ elif page == "🛠️ 投資工具箱":
                 - **PEG > 1.5**：⚠️ 昂貴 (股價可能透支了未來的成長)。
             """)
         
-        # ★★★ V34.2 FIX: 邏輯修正 ★★★
         col_v1, col_v2 = st.columns([1,1])
         with col_v1: v_sel = st.selectbox("選擇持股", [""] + my_stocks, key="fv_sel")
         with col_v2: val_input_text = st.text_input("或輸入代號", key="fv_inp").upper().strip()
         
-        # 決定最終要查的代號：如果有手動輸入就用手動，否則用選單
+        # 智慧邏輯：如果有手動輸入優先，沒有則用選單
         val_target = val_input_text if val_input_text else v_sel
         
         if st.button("💰 計算合理價", type="primary"):
@@ -631,12 +630,11 @@ elif page == "🛠️ 投資工具箱":
                         else: c3.info("無成長率數據")
                     else: st.error("無法取得財報數據")
 
-    # --- Tab 3: 個股診斷 (Smart Selector + V34.2 FIX) ---
+    # --- Tab 3: 個股診斷 (V34.2 Smart Selector Fix) ---
     with tab3:
         with st.expander("📖 說明書：怎麼看五力雷達圖？"):
             st.caption("圖形面積越大越好。\n- **獲利**：公司賺錢能力。\n- **成長**：營收是否在增加。\n- **估值**：越靠外圈代表越便宜。\n- **股息**：殖利率高低。\n- **ROE**：股東權益報酬率。")
         
-        # ★★★ V34.2 FIX ★★★
         col_d1, col_d2 = st.columns([1,1])
         with col_d1: d_sel = st.selectbox("選擇持股", [""] + my_stocks, key="diag_sel")
         with col_d2: diag_input_text = st.text_input("或輸入代號", key="diag_inp").upper().strip()
@@ -644,18 +642,95 @@ elif page == "🛠️ 投資工具箱":
         target = diag_input_text if diag_input_text else d_sel
         
         if st.button("🚀 診斷", key="diag_btn_simple"):
-            if not target: st.error("請輸入代號")
+            if not target: st.error("請輸入代號或選擇持股")
             else:
                 with st.spinner(f"正在分析 {target}..."):
                     st.plotly_chart(draw_k_line(target), use_container_width=True)
                     st.plotly_chart(draw_radar(target), use_container_width=True)
 
-    # --- Tab 4: 選股獵人 ---
+    # --- Tab 4: 選股獵人 (V36.0 Real Hunter) ---
     with tab4:
-        with st.expander("📖 說明書：三種獵槍的差別？"):
-            st.markdown("- **價值抄底**：專找 RSI < 30 的股票，適合想撿便宜的人。\n- **強勢突破**：專找剛站上月線的股票，適合想順勢操作的人。\n- **高股息**：專找配息穩定的股票，適合存股族。")
-        strategy = st.selectbox("掃描策略", ["價值抄底 (RSI < 30)", "強勢突破 (站上月線)"])
-        if st.button("🔍 掃描"): st.info("模擬掃描中... (需連接付費數據源)")
+        st.markdown("### 🏹 AI 實戰選股獵人")
+        st.caption("自動掃描市場熱門股 (美股七巨頭 + 半導體 + 熱門 ETF)，找出潛在機會。")
+        
+        with st.expander("📖 說明書：三種獵槍的差別？", expanded=True):
+            st.markdown("""
+            - **價值抄底**：專找 `RSI < 35` 的股票，適合想撿便宜的人。
+            - **強勢突破**：專找 `股價剛站上月線 (MA20)` 的股票，適合想順勢操作的人。
+            - **高股息**：專找 `殖利率 > 3%` 的股票，適合存股族。
+            """)
+            
+        strategy = st.selectbox("選擇狩獵策略", ["價值抄底 (RSI < 35)", "強勢突破 (站上月線)", "高股息 (殖利率 > 3%)"])
+        
+        if st.button("🔍 開始掃描 (約需 15 秒)", type="primary"):
+            # 1. 定義掃描清單 (熱門股)
+            watch_list = [
+                "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "GOOG", "META", "AMZN", "NFLX", # Tech
+                "TSM", "AVGO", "QCOM", "INTC", "MU", # Semi
+                "SCHD", "VYM", "VIG", "JEPI", # Dividend ETFs
+                "KO", "JNJ", "PG" # Safe Stocks
+            ]
+            
+            results = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i, ticker in enumerate(watch_list):
+                progress = (i + 1) / len(watch_list)
+                progress_bar.progress(progress)
+                status_text.caption(f"正在分析 {ticker}...")
+                
+                try:
+                    # 下載數據
+                    stock = yf.Ticker(ticker)
+                    df = stock.history(period="3mo")
+                    if len(df) < 20: continue
+                    
+                    # 計算指標
+                    df['RSI'] = calculate_rsi(df)
+                    df['MA20'] = df['Close'].rolling(window=20).mean()
+                    curr_price = df['Close'].iloc[-1]
+                    curr_rsi = df['RSI'].iloc[-1]
+                    curr_ma20 = df['MA20'].iloc[-1]
+                    prev_price = df['Close'].iloc[-2]
+                    prev_ma20 = df['MA20'].iloc[-2]
+                    
+                    # 判斷邏輯
+                    is_match = False
+                    reason = ""
+                    
+                    if "價值抄底" in strategy:
+                        if curr_rsi < 35:
+                            is_match = True
+                            reason = f"RSI={curr_rsi:.1f} (超賣)"
+                    elif "強勢突破" in strategy:
+                        # 黃金交叉月線：昨天在線下，今天在線上
+                        if prev_price < prev_ma20 and curr_price > curr_ma20:
+                            is_match = True
+                            reason = f"突破月線 (Price: {curr_price:.2f} > MA20: {curr_ma20:.2f})"
+                    elif "高股息" in strategy:
+                        div_rate = stock.info.get('dividendYield', 0)
+                        if div_rate and div_rate > 0.03:
+                            is_match = True
+                            reason = f"殖利率: {div_rate*100:.2f}%"
+                    
+                    if is_match:
+                        results.append({
+                            "代碼": ticker,
+                            "現價": f"${curr_price:.2f}",
+                            "入選理由": reason
+                        })
+                        
+                except: pass
+            
+            progress_bar.empty()
+            status_text.empty()
+            
+            if results:
+                st.success(f"🎉 掃描完成！發現 {len(results)} 檔符合條件的標的：")
+                st.dataframe(pd.DataFrame(results), use_container_width=True)
+            else:
+                st.info("🧹 掃描完成，可惜目前沒有符合此策略的股票。")
 
     # --- Tab 5: 相關性熱圖 ---
     with tab5:
@@ -673,7 +748,7 @@ elif page == "🛠️ 投資工具箱":
                     else: st.error("無法生成圖表")
         else: st.warning("持股數量不足 2 支，無法計算相關性。")
 
-    # --- Tab 6: 事件雷達 (Smart Selector + V34.2 FIX) ---
+    # --- Tab 6: 事件雷達 (V34.2 Smart Selector Fix) ---
     with tab6:
         st.markdown("### 💣 財報與除息雷達")
         with st.expander("📖 說明書：為什麼要避開財報日？"):
@@ -715,7 +790,7 @@ elif page == "🛠️ 投資工具箱":
         st.divider()
         st.caption("或查詢特定代號：")
         
-        # ★★★ V34.2 FIX ★★★
+        # ★★★ V34.2 FIX: 智慧選單 ★★★
         col_r1, col_r2 = st.columns([1,1])
         with col_r1: r_sel = st.selectbox("選擇持股", [""] + my_stocks, key="radar_sel")
         with col_r2: radar_input_text = st.text_input("或輸入代號", key="radar_inp").upper().strip()
@@ -741,51 +816,36 @@ elif page == "🛠️ 投資工具箱":
                     else: st.caption("無相關新聞")
                 except: st.error("查無資料")
 
-    # --- Tab 7: 組合健檢 ---
+    # --- Tab 7: 組合健檢 (V35.0 True Health Check) ---
     with tab7:
-        # ★★★ V35.0 NEW: 產業健檢 ★★★
         df_inv, _, _ = calculate_portfolio(load_data())
         if not df_inv.empty:
             with st.spinner("正在分析持股產業結構..."):
-                
-                # 1. 抓取產業資料 (Sector)
                 sector_data = []
                 for i, row in df_inv.iterrows():
                     sym = row['代碼']
                     try:
-                        # 嘗試抓取 Sector，抓不到就歸類為 "Other"
                         info = yf.Ticker(sym).info
                         sector = info.get('sector', 'Other')
-                    except:
-                        sector = 'Other'
-                    
-                    # 計算最新市值
+                    except: sector = 'Other'
                     p = get_usd_price(sym)
                     mkt_val = p * row['持股']
-                    
                     sector_data.append({'Sector': sector, 'MarketValue': mkt_val, 'Symbol': sym})
                 
                 df_sector = pd.DataFrame(sector_data)
-                
-                # 2. 繪製圖表
                 col_chart1, col_chart2 = st.columns(2)
-                
                 with col_chart1:
                     st.markdown("### 🏭 產業分散度")
-                    fig_sec = px.pie(df_sector, values='MarketValue', names='Sector', hole=0.4)
-                    st.plotly_chart(fig_sec, use_container_width=True)
-                    
+                    st.plotly_chart(px.pie(df_sector, values='MarketValue', names='Sector', hole=0.4), use_container_width=True)
                 with col_chart2:
-                    st.markdown("### 👑 個股權重 (Top Holdings)")
-                    fig_hold = px.pie(df_sector, values='MarketValue', names='Symbol', hole=0.4)
-                    st.plotly_chart(fig_hold, use_container_width=True)
-                    
-                # 3. 文字分析
-                top_sector = df_sector.groupby('Sector')['MarketValue'].sum().idxmax()
-                top_stock = df_sector.loc[df_sector['MarketValue'].idxmax()]['Symbol']
-                st.info(f"💡 **AI 觀點**：您的資金最集中在 **{top_sector}** 產業；第一大持股是 **{top_stock}**。")
+                    st.markdown("### 👑 個股權重")
+                    st.plotly_chart(px.pie(df_sector, values='MarketValue', names='Symbol', hole=0.4), use_container_width=True)
                 
-        else: st.warning("無庫存，無法進行健檢。")
+                if not df_sector.empty:
+                    top_sector = df_sector.groupby('Sector')['MarketValue'].sum().idxmax()
+                    top_stock = df_sector.loc[df_sector['MarketValue'].idxmax()]['Symbol']
+                    st.info(f"💡 **AI 觀點**：您的資金最集中在 **{top_sector}** 產業；第一大持股是 **{top_stock}**。")
+        else: st.warning("無庫存")
 
 # ==========================================
 # 頁面 3, 4: Admin Only
@@ -827,5 +887,5 @@ elif page == "⚙️ 設定":
         new_g = st.text_input("Gemini", value=st.session_state.gemini_key, type="password")
         if st.button("Update"): st.session_state.openai_key = new_o; st.session_state.gemini_key = new_g; st.success("OK")
     
-    # 這裡不需要再呼叫 load_local_csv，因為現在是雲端版
+    # V34.3 FIX: 雲端版不需要 load_local_csv，但為了避免 NameError，我們可以放一個空操作或提示
     st.caption("目前使用 Google Sheets 雲端資料庫。")
