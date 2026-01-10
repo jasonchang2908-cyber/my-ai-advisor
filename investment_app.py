@@ -73,7 +73,7 @@ def save_data_to_gsheet(df):
         return True
     except: return False
 
-# ★★★ V39.1 FIX: 補回 load_local_csv ★★★
+# V39.1 FIX: load_local_csv
 def load_local_csv():
     local_file = 'my_portfolio.csv'
     if os.path.exists(local_file):
@@ -716,7 +716,7 @@ elif page == "🛠️ 投資工具箱":
         st.markdown("### ⚖️ 價值投資計算器 (Graham/Lynch)")
         with st.expander("📖 說明書：股價多少算便宜？"):
             st.info("""
-            - **葛拉漢數字 (Graham Number)**：這是最保守的估值，適合傳統產業。如果 **現價 <葛拉漢價**，代表非常有安全邊際。
+            - **葛拉漢數字 (Graham Number)**：這是最保守的估值，適合傳統產業。如果 **現價 < 葛拉漢價**，代表非常有安全邊際。
             - **PEG 指標**：這是成長股神器 (彼得林區最愛)。
                 - **PEG < 1**：✅ 便宜 (成長速度 > 本益比)。
                 - **PEG > 1.5**：⚠️ 昂貴 (股價可能透支了未來的成長)。
@@ -939,7 +939,8 @@ elif page == "🛠️ 投資工具箱":
                         cal = stock.calendar
                         event_str = "無"
                         if cal and isinstance(cal, dict) and 'Earnings Date' in cal:
-                            event_str = f"財報日 {cal['Earnings Date'][0]}"
+                            event_date = cal['Earnings Date'][0]
+                            event_str = f"財報日 {event_date}"
                         
                         # 2. 新聞 (Google RSS)
                         news = get_stock_news(symbol)
@@ -1054,11 +1055,15 @@ elif page == "📝 交易紀錄":
                     st.session_state['missing_divs'] = missing
             if 'missing_divs' in st.session_state and st.session_state['missing_divs']:
                 st.success(f"發現 {len(st.session_state['missing_divs'])} 筆漏記！")
-                st.dataframe(pd.DataFrame(st.session_state['missing_divs']))
-                if st.button("💾 加入帳本"):
-                    new_rec = pd.DataFrame(st.session_state['missing_divs']).drop(columns=['Info'])
+                
+                # ★★★ V40.0 FIX: 改用 data_editor 讓用戶直接編輯金額 ★★★
+                edited_missing = st.data_editor(pd.DataFrame(st.session_state['missing_divs']), use_container_width=True)
+                
+                if st.button("💾 加入帳本 (以修改後的金額為準)"):
+                    # 將修改後的 df 轉回一般格式並儲存
+                    new_rec = edited_missing.drop(columns=['Info'])
                     save_data_to_gsheet(pd.concat([df_trans, new_rec], ignore_index=True))
-                    st.success("成功！"); del st.session_state['missing_divs']; st.rerun()
+                    st.success("成功加入！"); del st.session_state['missing_divs']; st.rerun()
         
         edited_df = st.data_editor(df_trans, num_rows="dynamic", use_container_width=True, hide_index=True)
         if st.button("💾 儲存變更"):
